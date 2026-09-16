@@ -1,6 +1,5 @@
 -- lush
 -- version 1.0
--- license: MIT
 
 -- this is necessary for every single subclass, because they might call super() and get proxies at any stage in the MRO
 local function invalidate_super_cache_once(class, k)
