@@ -355,14 +355,14 @@ end
 
 local Object = create_class()
 
-function noop() end
+function noop(class) end
 Object.construct = noop
 Object.destruct = noop
 
-function Object:allocate() return {} end
+function Object.allocate(class) return {} end
 
-function Object:new(...)
-    local instance = setmetatable(self:allocate(), self.__cache)
+function Object.new(class, ...)
+    local instance = setmetatable(class:allocate(), class.__cache)
     instance:construct(...)
     return instance
 end
