@@ -1,7 +1,4 @@
--- lush
--- version 1.0
-
--- this is necessary for every single subclass, because they might call super() and get proxies at any stage in the MRO
+-- this is necessary for every single subclass, because they might call super() and get proxies at any stage in the MRO, and subsequent access on the proxy might cache something. Not all proxies are shared, and redundant deletion is faster than checking which ones are shared to only invalidate partially further
 local function invalidate_super_cache_once(class, k)
     local orders = class.__orders
     local super_cache = class.__super_cache
@@ -14,24 +11,37 @@ local function invalidate_super_cache_once(class, k)
     end
 end
 
-local function invalidate_super_cache(class, k)
+local function invalidate_super_cache(class, k, visited)
+    visited[class] = true
     invalidate_super_cache_once(class, k)
 
     for subclass, v in pairs(class.__subclass_map) do
-        invalidate_super_cache(subclass, k)
+        if not visited[subclass] then
+            invalidate_super_cache(subclass, k, visited)
+        end
     end
 end
 
-local function invalidate_cache(class, k)
+-- based on my benchmarks, recursion is faster than another breadth-first approach with same semantics
+local function invalidate_cache(class, k, visited)
+    -- track visited in case a child class inherits from 2 parent classes that both inherit from the same grandparent class, where with DFS, the child may be visited twice 
+    visited[class] = true
     class.__cache[k] = nil
 
     for subclass, v in pairs(class.__subclass_map) do
-        if subclass.__declared[k] == nil then
-            invalidate_cache(subclass, k)
-            invalidate_super_cache_once(subclass, k)
-        else
-            -- use a different recursion because invalidate_cache stops recursing
-            invalidate_super_cache(subclass, k)
+
+        if not visited[subclass] then
+
+            -- didn't override means their cache entry needs to be invalidated
+            if subclass.__declared[k] == nil then
+                invalidate_cache(subclass, k, visited)
+                invalidate_super_cache_once(subclass, k)
+            else
+                -- otherwise only invalidate super_cache is necessary
+                -- use a different recursion because invalidate_cache stops recursing
+                invalidate_super_cache(subclass, k, visited)
+            end
+
         end
     end
 end
@@ -39,13 +49,13 @@ end
 -- don't reassign internals like class, __declared, etc
 local function declare_key(class, k, f)
     class.__declared[k] = f
-    invalidate_cache(class, k)
+    invalidate_cache(class, k, {})
 end
 
-
+-- invariant: class.__orders is never reassigned
 local MRO_PROXY = {
     __index = function(proxy, k)
-        local orders = proxy.__class.__orders
+        local orders = proxy.__orders
 
         for i = proxy.__i, #orders do
             local v = orders[i].__declared[k]
@@ -62,12 +72,13 @@ local MRO_PROXY = {
 -- false mean end of MRO, nil mean not found in MRO
 -- both super(instance, currentclass) and super(class, currentclass) works
 -- you can also use super() as instanceof via super(self, currentclass) ~= nil
-local function next_superclass(instance, class)
-    return instance.class.__super_cache[class]
+local function next_superclass(instance, currentclass)
+    return instance.class.__super_cache[currentclass]
 end
 
-local function create_proxy(class, i)
-    return setmetatable({__i = i + 1, __class = class}, MRO_PROXY)
+-- inclusive i
+local function create_proxy(orders, i)
+    return setmetatable({__i = i, __orders = orders}, MRO_PROXY)
 end
 
 local function remove_at(array, i, n)
@@ -86,17 +97,22 @@ local function count_tail(superclass, tail_map)
     tail_map[superclass] = count + 1
 end
 
--- C3 fails anyway if you give duplicate superclasses, so I didn't write checks for it
+-- invariant: class will not appear in its own superclasses, because of the way the API is designed
 local function resolve_inheritance(class)
     local superclasses = class.__superclasses
     local superclasses_n = #superclasses
 
+    local super_cache = class.__super_cache
+
+    -- book keeping
     if superclasses_n == 0 then
+        super_cache[class] = false
         return
     end
 
+    -- invariant: orders already assigned
     local orders = class.__orders
-    local super_cache = class.__super_cache
+
     
     if superclasses_n == 1 then
 
@@ -121,7 +137,7 @@ local function resolve_inheritance(class)
             super_cache[class] = superclass.__declared
         else
             super_cache[superclass_orders[superclass_orders_n - 1]] = lastclass.__declared
-            super_cache[class] = create_proxy(class, 1)
+            super_cache[class] = create_proxy(orders, 2)
         end
 
         superclass.__subclass_map[class] = true
@@ -129,6 +145,17 @@ local function resolve_inheritance(class)
         return
     end
 
+    -- invariant: no redundancy
+    for i = 1, superclasses_n - 1 do
+        local superclass_super_cache = superclasses[i].__super_cache
+        for j = i + 1, superclasses_n do
+            if superclass_super_cache[superclasses[j]] ~= nil then
+                error("redundant inheritance")
+            end
+        end
+    end
+
+    -- invariant: class.__orders is always set to {class} before calling resolve_inheritance(class)
     local orders_n = 1
     
     local superclasses_orders_cursor_map = {[superclasses] = 1}
@@ -212,11 +239,12 @@ local function resolve_inheritance(class)
 
     until i > superclasses_orders_n
 
+    -- invariant: C3 errors if class(superclass, subclass), so even if the redundancy test passed, this will ensure it
     if superclasses_orders_n > 0 then
         error("cannot find a resolution for multiple inheritance")
     end
 
-    super_cache[class] = create_proxy(class, 1)
+    super_cache[class] = create_proxy(orders, 2)
 
     local lastclass = orders[orders_n]
     super_cache[lastclass] = false
@@ -224,48 +252,62 @@ local function resolve_inheritance(class)
     local secondlastclass = orders[orders_n - 1]
     super_cache[secondlastclass] = lastclass.__declared
 
-    -- lastclass, secondlastclass, class are 3 cases that are all handled for super_cache
+    -- lastclass, secondlastclass, class are 3 cases that are all handled for super_cache, can return early if no more proxies needed
     if orders_n == 3 then
         return
     end
 
 
     -- reuse proxy if possible
-    for i = 1, superclasses_n do
+    -- because of the no redundancy invariant, no superclass can have contain another superclass's orders[1 to #orders - 2], which is the mid segment relative to class.__orders, so there is never going to be a case where one superclass can share all of its proxies, thus early return in the loop because all sharable proxies are gathered from the superclasses will never be needed
+    for i = superclasses_n, 1, -1 do
         local superclass = superclasses[i]
         local superclass_orders = superclass.__orders
         local superclass_super_cache = superclass.__super_cache
 
         local superclass_orders_n = #superclass_orders
-        local offset = orders_n - superclass_orders_n
 
         if superclass_orders[superclass_orders_n] == lastclass and superclass_orders[superclass_orders_n - 1] == secondlastclass then
 
-            
-            local leftover_count = orders_n
+            local offset = orders_n - superclass_orders_n
 
             for j = superclass_orders_n - 2, 1, -1 do
                 local inner_superclass = superclass_orders[j]
                 if inner_superclass == orders[j + offset] then
                     super_cache[inner_superclass] = superclass_super_cache[inner_superclass]
-                    leftover_count = leftover_count - 1
                 else
                     break
                 end
             end
 
-            if leftover_count == 3 then
-                return
-            end
+            -- can break after finding the first one in reverse, because for example:
+            --[[
+                superclass_orders_1: A, B, C, D
+                superclass_orders_2: X, Y, B, C, D
+
+                orders: class, A, X, Y, B, C, D
+
+                this shows given any 2 superclass_orders that partially shares the ancestry, because C3 prioritizes the left-side of superclasses, so the right-side always end up in the later portion of class.__orders
+                thus the most you can share is the first one with the same last 2 classes when searching in reverse
+
+                superclass_orders_1: A, B, C
+                superclass_orders_2: O, P, Q
+
+                orders: class, A, B, C, O, P, Q
+
+                later superclass_orders that does not partially share any ancestry simply renders all previous partially shared ancestries unsharable
+            ]]
+
+            break
 
         end
     end
 
-    -- create proxies for those that cannot be reused
+    -- create necessary new proxies
     for i = 2, orders_n - 2 do
         local superclass = orders[i]
         if super_cache[superclass] == nil then
-            super_cache[superclass] = create_proxy(class, i)
+            super_cache[superclass] = create_proxy(orders, i + 1)
         end
     end
 
@@ -290,56 +332,17 @@ local MRO_CACHE = {
     end
 }
 
-local MRO_SUPERCLASSES
-
-local function create_superclasses(class, ...)
-    return setmetatable({[0] = class, ...}, MRO_SUPERCLASSES)
-end
-
-local function propagate_superclass_change(class)
-    local cache = class.__cache -- cannot reassign cache, because instance need the same ref
-    for k, v in pairs(class.__cache) do
-        cache[k] = nil
-    end
-    cache.class = class
-    cache.__index = cache
-
-    class.__super_cache = {}
-    class.__orders = {class}
-    resolve_inheritance(class)
-
-    for subclass, v in pairs(class.__subclass_map) do
-        propagate_superclass_change(subclass)
-    end
-end
-
-MRO_SUPERCLASSES = {
-    -- if you wanted to make class inherit itself, I am not stopping you
-    __call = function(superclasses, ...)
-        local class = superclasses[0]
-
-        for i = 1, #superclasses do
-            superclasses[i].__subclass_map[class] = nil
-        end
-
-        class.__superclasses = create_superclasses(class, ...)
-
-        propagate_superclass_change(class)
-    end
-}
-
 local function create_class(...)
     local class = {
         __declared = {},
         __subclass_map = setmetatable({}, WEAK_K),
         __super_cache = {},
+        __superclasses = {...}
     }
 
     local cache = setmetatable({class = class}, MRO_CACHE)
     cache.__index = cache
     class.__cache = cache
-
-    class.__superclasses = create_superclasses(class, ...)
 
     class.__orders = {class}
     resolve_inheritance(class)
@@ -348,14 +351,14 @@ local function create_class(...)
 end
 
 
--- lua metamethods are not supported
+-- lua metamethods are not supported, because cache is lazy, metamethod requires the metamethod to be physically present in cache
 --------------------------------------------------------------------------------------------------------------------------------
 -- Built-in
 --------------------------------------------------------------------------------------------------------------------------------
-
+-- inherit from Object is opt-in, feel free to make your own life cycle/conventions
 local Object = create_class()
 
-function noop(class) end
+function noop() end
 Object.construct = noop
 Object.destruct = noop
 
