@@ -3,6 +3,7 @@ local function invalidate_super_cache_once(class, k)
     local orders = class.__orders
     local super_cache = class.__super_cache
 
+    -- proxies only appear from 1 to #orders - 2, since the last one point to nil, and second last one point to last one's __declared
     for i = 1, #orders - 2 do
         local proxy = super_cache[orders[i]]
         if proxy then
@@ -258,50 +259,27 @@ local function resolve_inheritance(class)
     end
 
 
+    
     -- reuse proxy if possible
-    -- because of the no redundancy invariant, no superclass can have contain another superclass's orders[1 to #orders - 2], which is the mid segment relative to class.__orders, so there is never going to be a case where one superclass can share all of its proxies, thus early return in the loop because all sharable proxies are gathered from the superclasses will never be needed
-    for i = superclasses_n, 1, -1 do
-        local superclass = superclasses[i]
-        local superclass_orders = superclass.__orders
-        local superclass_super_cache = superclass.__super_cache
+    -- because of the no redundancy invariant, the last superclass(since C3 prioritizes superclass from to right) is guaranteed to have the most sharable proxies possible
+    local last_superclass = superclasses[superclasses_n]
+    local last_superclass_orders = last_superclass.__orders
+    local last_superclass_orders_n = #last_superclass_orders
+    local last_superclass_super_cache = last_superclass.__super_cache
 
-        local superclass_orders_n = #superclass_orders
 
-        if superclass_orders[superclass_orders_n] == lastclass and superclass_orders[superclass_orders_n - 1] == secondlastclass then
+    local offset = orders_n - last_superclass_orders_n
 
-            local offset = orders_n - superclass_orders_n
-
-            for j = superclass_orders_n - 2, 1, -1 do
-                local inner_superclass = superclass_orders[j]
-                if inner_superclass == orders[j + offset] then
-                    super_cache[inner_superclass] = superclass_super_cache[inner_superclass]
-                else
-                    break
-                end
-            end
-
-            -- can break after finding the first one in reverse, because for example:
-            --[[
-                superclass_orders_1: A, B, C, D
-                superclass_orders_2: X, Y, B, C, D
-
-                orders: class, A, X, Y, B, C, D
-
-                this shows given any 2 superclass_orders that partially shares the ancestry, because C3 prioritizes the left-side of superclasses, so the right-side always end up in the later portion of class.__orders
-                thus the most you can share is the first one with the same last 2 classes when searching in reverse
-
-                superclass_orders_1: A, B, C
-                superclass_orders_2: O, P, Q
-
-                orders: class, A, B, C, O, P, Q
-
-                later superclass_orders that does not partially share any ancestry simply renders all previous partially shared ancestries unsharable
-            ]]
-
+    for i = last_superclass_orders_n - 2, 1, -1 do
+        local superclass = last_superclass_orders[i]
+        if superclass == orders[i + offset] then
+            super_cache[superclass] = last_superclass_super_cache[superclass]
+        else
             break
-
         end
     end
+
+
 
     -- create necessary new proxies
     for i = 2, orders_n - 2 do
@@ -358,7 +336,7 @@ end
 -- inherit from Object is opt-in, feel free to make your own life cycle/conventions
 local Object = create_class()
 
-function noop() end
+local function noop() end
 Object.construct = noop
 Object.destruct = noop
 
