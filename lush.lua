@@ -1,3 +1,6 @@
+-- library: lush
+-- version: 1.0
+
 -- this is necessary for every single subclass, because they might call super() and get proxies at any stage in the MRO, and subsequent access on the proxy might cache something. Not all proxies are shared, and redundant deletion is faster than checking which ones are shared to only invalidate partially further
 local function invalidate_super_cache_once(class, k)
     local orders = class.__orders
@@ -98,7 +101,7 @@ local function count_tail(superclass, tail_map)
     tail_map[superclass] = count + 1
 end
 
--- invariant: class will not appear in its own superclasses, because of the way the API is designed
+
 local function resolve_inheritance(class)
     local superclasses = class.__superclasses
     local superclasses_n = #superclasses
@@ -109,6 +112,14 @@ local function resolve_inheritance(class)
     if superclasses_n == 0 then
         super_cache[class] = false
         return
+    end
+
+    -- invariant: class should not appear as its own superclass
+    for i = 1, superclasses_n do
+        local superclass = superclasses[i]
+        if superclass == class or superclass.__super_cache[class] ~= nil then
+            error("cyclic inheritance")
+        end
     end
 
     -- invariant: orders already assigned
@@ -310,22 +321,108 @@ local MRO_CACHE = {
     end
 }
 
+local SUPERCLASSES = {}
+
+local function create_superclasses(class, ...)
+    return setmetatable({__class = class, ...}, SUPERCLASSES)
+end
+
 local function create_class(...)
     local class = {
         __declared = {},
         __subclass_map = setmetatable({}, WEAK_K),
         __super_cache = {},
-        __superclasses = {...}
     }
 
     local cache = setmetatable({class = class}, MRO_CACHE)
     cache.__index = cache
     class.__cache = cache
 
+    class.__superclasses = create_superclasses(class, ...)
     class.__orders = {class}
     resolve_inheritance(class)
 
     return setmetatable(class, {__index = cache, __newindex = declare_key})
+end
+
+--------------------------------------------------------------------------------------------------------------------------------
+-- Change Inheritance
+--------------------------------------------------------------------------------------------------------------------------------
+
+-- reset class to the state prior to resolve inheritance
+local function reset_class(class)
+
+    -- reset cache, need to empty because instances' metatable is cache, can't just replace
+    local declared = class.__declared
+    local cache = class.__cache
+    for k, v in pairs(cache) do
+        if declared[k] == nil then
+            -- if declared directly, cache entry is fine
+            cache[k] = nil
+        end
+    end
+    cache.class = class
+    cache.__index = cache
+
+    -- remove all old relationship
+    local superclasses = class.__superclasses
+    for i = 1, #superclasses do
+        superclasses[i].__subclass_map[class] = nil
+    end
+
+    -- replace old orders & super cache, old proxy will not be synced
+    class.__orders = {class}
+    class.__super_cache = {}
+end
+
+local function reset_resolve_inheritance(class)
+    reset_class(class)
+    resolve_inheritance(class)
+end
+
+local function dependency_resolve_inheritance(class, root, visited)
+    if visited[class] then
+        return
+    end
+    visited[class] = true
+
+    local orders = class.__orders
+
+    for i = #orders, 2, -1 do
+        local superclass = orders[i]
+        if superclass.__super_cache[root] ~= nil then
+            dependency_resolve_inheritance(superclass, root, visited)
+        end
+    end
+
+    reset_resolve_inheritance(class)
+end
+
+local function explore_leaf_dependency_resolve_inheritance(class, root, visited)
+    local subclass_map = class.__subclass_map
+
+    if next(subclass_map) == nil then
+        dependency_resolve_inheritance(class, root, visited)
+        return
+    end
+
+    for subclass, v in pairs(subclass_map) do
+        explore_leaf_dependency_resolve_inheritance(subclass, root, visited)
+    end
+end
+
+function SUPERCLASSES.__call(superclasses, mode, ...)
+    local class = superclasses.__class
+    
+    -- recursive
+    if mode == "r" then
+        class.__superclasses = create_superclasses(class, ...)
+        explore_leaf_dependency_resolve_inheritance(class, class, {})
+    else
+        -- don't change subclasses
+        class.__superclasses = create_superclasses(class, mode, ...)
+        reset_resolve_inheritance(class)
+    end
 end
 
 
