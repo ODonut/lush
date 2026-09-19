@@ -50,7 +50,7 @@ local function invalidate_cache(class, k, visited)
     end
 end
 
--- don't reassign internals like class, __declared, etc
+-- don't reassign internals like __class, __declared, etc
 local function declare_key(class, k, f)
     class.__declared[k] = f
     invalidate_cache(class, k, {})
