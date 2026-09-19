@@ -77,7 +77,7 @@ local MRO_PROXY = {
 -- both super(instance, currentclass) and super(class, currentclass) works
 -- you can also use super() as instanceof via super(self, currentclass) ~= nil
 local function next_superclass(instance, currentclass)
-    return instance.class.__super_cache[currentclass]
+    return instance.__class.__super_cache[currentclass]
 end
 
 -- inclusive i
@@ -306,7 +306,7 @@ local WEAK_K = {__mode = "k"}
 
 local MRO_CACHE = {
     __index = function(cache, k)
-        local class = cache.class
+        local class = cache.__class
         local orders = class.__orders
 
         for i = 1, #orders do
@@ -324,7 +324,7 @@ local MRO_CACHE = {
 local SUPERCLASSES = {}
 
 local function create_superclasses(class, ...)
-    return setmetatable({__class = class, ...}, SUPERCLASSES)
+    return setmetatable({[0] = class, ...}, SUPERCLASSES)
 end
 
 local function create_class(...)
@@ -334,7 +334,7 @@ local function create_class(...)
         __super_cache = {},
     }
 
-    local cache = setmetatable({class = class}, MRO_CACHE)
+    local cache = setmetatable({__class = class}, MRO_CACHE)
     cache.__index = cache
     class.__cache = cache
 
@@ -361,7 +361,7 @@ local function reset_class(class)
             cache[k] = nil
         end
     end
-    cache.class = class
+    cache.__class = class
     cache.__index = cache
 
     -- remove all old relationship
@@ -412,7 +412,7 @@ local function explore_leaf_dependency_resolve_inheritance(class, root, visited)
 end
 
 function SUPERCLASSES.__call(superclasses, mode, ...)
-    local class = superclasses.__class
+    local class = superclasses[0]
     
     -- recursive
     if mode == "r" then
@@ -433,16 +433,43 @@ end
 -- inherit from Object is opt-in, feel free to make your own life cycle/conventions
 local Object = create_class()
 
-local function noop() end
-Object.construct = noop
-Object.destruct = noop
-
 function Object.allocate(class) return {} end
 
 function Object.new(class, ...)
     local instance = setmetatable(class:allocate(), class.__cache)
     instance:construct(...)
     return instance
+end
+
+local function noop() end
+Object.construct = noop
+Object.destruct = noop
+Object.equals = rawequal
+Object.toString = tostring
+
+function Object:getClass()
+    return self.__class
+end
+
+local MAX_INTEGER = 2^53 - 1
+local next_hashCode = -MAX_INTEGER
+
+function Object:hashCode()
+    local hashCode = self._hashCode
+
+    if hashCode == nil then
+
+        hashCode = next_hashCode
+        self._hashCode = hashCode
+
+        if next_hashCode == MAX_INTEGER then
+            next_hashCode = -MAX_INTEGER
+        else
+            next_hashCode = next_hashCode + 1
+        end
+    end
+
+    return hashCode
 end
 
 --------------------------------------------------------------------------------------------------------------------------------
