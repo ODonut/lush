@@ -1,23 +1,22 @@
 -- library: lush
 -- version: 1.0
 
--- this is necessary for every single subclass, because they might call super() and get proxies at any stage in the MRO, and subsequent access on the proxy might cache something. Not all proxies are shared, and redundant deletion is faster than checking which ones are shared to only invalidate partially further
+-- this is necessary for every single subclass, because they might call super() and get proxies at any stage in the MRO, and subsequent access on the proxy might cache something.
 local function invalidate_super_cache_once(class, k)
     local orders = class.__orders
     local super_cache = class.__super_cache
 
     -- proxies only appear from 1 to #orders - 2, since the last one point to nil, and second last one point to last one's __declared
     for i = 1, #orders - 2 do
-        local proxy = super_cache[orders[i]]
-        if proxy then
-            proxy[k] = nil
-        end
+        -- invariant: proxies always exist from 1 to #orders - 2
+        super_cache[orders[i]][k] = nil
     end
 end
 
 local function invalidate_super_cache(class, k, visited)
-    visited[class] = true
+
     invalidate_super_cache_once(class, k)
+    visited[class] = true
 
     for subclass, v in pairs(class.__subclass_map) do
         if not visited[subclass] then
@@ -26,11 +25,11 @@ local function invalidate_super_cache(class, k, visited)
     end
 end
 
--- based on my benchmarks, recursion is faster than another breadth-first approach with same semantics
-local function invalidate_cache(class, k, visited)
+-- based on my benchmarks, recursion is faster than another breadth-first approach
+local function recurse_modify_cache(invalidate_cache, class, k, visited)
+
     -- track visited in case a child class inherits from 2 parent classes that both inherit from the same grandparent class, where with DFS, the child may be visited twice 
     visited[class] = true
-    class.__cache[k] = nil
 
     for subclass, v in pairs(class.__subclass_map) do
 
@@ -50,26 +49,51 @@ local function invalidate_cache(class, k, visited)
     end
 end
 
+local function invalidate_cache(class, k, visited)
+    class.__cache[k] = nil
+    recurse_modify_cache(invalidate_cache, class, k, visited)
+end
+
+local function memoize(cache, k, orders, i)
+    for j = i, #orders do
+        local v = orders[j].__declared[k]
+        if v ~= nil then
+            cache[k] = v
+            return v
+        end
+    end
+    return nil
+end
+
+local function refresh_cache(class, k, visited)
+    memoize(class.__cache, k, class.__orders, 1)
+    recurse_modify_cache(refresh_cache, class, k, visited)
+end
+
+local function is_metamethod(k)
+    return type(k) == "string" and k:sub(1, 2) == "__"
+end
+
 -- don't reassign internals like __class, __declared, etc
 local function declare_key(class, k, f)
     class.__declared[k] = f
-    invalidate_cache(class, k, {})
+
+    -- metamethods needs to be physically in cache everytime to work
+    if is_metamethod(k) then
+        -- if class itself declared it, it overrides, so the first memoize can be simplified as direct assignment
+        class.__cache[k] = f
+        recurse_modify_cache(refresh_cache, class, k, {})
+
+    else
+
+        invalidate_cache(class, k, {})
+    end
 end
 
--- invariant: class.__orders is never reassigned
+-- class.__orders might be reassigned, proxy won't sync, be aware
 local MRO_PROXY = {
     __index = function(proxy, k)
-        local orders = proxy.__orders
-
-        for i = proxy.__i, #orders do
-            local v = orders[i].__declared[k]
-            if v ~= nil then
-                proxy[k] = v
-                return v
-            end
-        end
-
-        return nil
+        return memoize(proxy, k, proxy.__orders, proxy.__i)
     end
 }
 
@@ -101,6 +125,17 @@ local function count_tail(superclass, tail_map)
     tail_map[superclass] = count + 1
 end
 
+-- invariant: cache is empty when this run
+local function warm_cache_metamethod(cache, orders, orders_n)
+    -- IMPORTANT: includes class itself, resolve_inheritance populates metamethods to cache
+    for i = 1, orders_n do
+        for k, v in pairs(orders[i].__declared) do
+            if is_metamethod(k) and rawget(cache, k) == nil then
+                cache[k] = v
+            end
+        end
+    end
+end
 
 local function resolve_inheritance(class)
     local superclasses = class.__superclasses
@@ -124,6 +159,7 @@ local function resolve_inheritance(class)
 
     -- invariant: orders already assigned
     local orders = class.__orders
+    local cache = class.__cache
 
     
     if superclasses_n == 1 then
@@ -153,6 +189,10 @@ local function resolve_inheritance(class)
         end
 
         superclass.__subclass_map[class] = true
+
+
+        -- handle metamethod
+        warm_cache_metamethod(cache, orders, superclass_orders_n + 1)
 
         return
     end
@@ -256,6 +296,12 @@ local function resolve_inheritance(class)
         error("cannot find a resolution for multiple inheritance")
     end
 
+
+    -- handle metamethod
+    warm_cache_metamethod(cache, orders, orders_n)
+
+
+
     super_cache[class] = create_proxy(orders, 2)
 
     local lastclass = orders[orders_n]
@@ -272,7 +318,7 @@ local function resolve_inheritance(class)
 
     
     -- reuse proxy if possible
-    -- because of the no redundancy invariant, the last superclass(since C3 prioritizes superclass from to right) is guaranteed to have the most sharable proxies possible
+    -- because of the no redundancy invariant, the last superclass(since C3 prioritizes superclass from left to right) is guaranteed to have the most sharable proxies possible
     local last_superclass = superclasses[superclasses_n]
     local last_superclass_orders = last_superclass.__orders
     local last_superclass_orders_n = #last_superclass_orders
@@ -306,18 +352,7 @@ local WEAK_K = {__mode = "k"}
 
 local MRO_CACHE = {
     __index = function(cache, k)
-        local class = cache.__class
-        local orders = class.__orders
-
-        for i = 1, #orders do
-            local v = orders[i].__declared[k]
-            if v ~= nil then
-                cache[k] = v
-                return v
-            end
-        end
-
-        return nil
+        return memoize(cache, k, cache.__class.__orders, 1)
     end
 }
 
@@ -380,35 +415,11 @@ local function reset_resolve_inheritance(class)
     resolve_inheritance(class)
 end
 
-local function dependency_resolve_inheritance(class, root, visited)
-    if visited[class] then
-        return
-    end
-    visited[class] = true
-
-    local orders = class.__orders
-
-    for i = #orders, 2, -1 do
-        local superclass = orders[i]
-        if superclass.__super_cache[root] ~= nil then
-            dependency_resolve_inheritance(superclass, root, visited)
-        end
-    end
-
-    reset_resolve_inheritance(class)
-end
-
-local function explore_leaf_dependency_resolve_inheritance(class, root, visited)
-    local subclass_map = class.__subclass_map
-
-    if next(subclass_map) == nil then
-        dependency_resolve_inheritance(class, root, visited)
-        return
-    end
-
-    for subclass, v in pairs(subclass_map) do
-        explore_leaf_dependency_resolve_inheritance(subclass, root, visited)
-    end
+local function shrink_level(subclasses, i, level_n, subclasses_n)
+    subclasses[i] = subclasses[level_n]
+    subclasses[level_n] = subclasses[subclasses_n]
+    subclasses[subclasses_n] = nil
+    return level_n - 1, subclasses_n - 1
 end
 
 function SUPERCLASSES.__call(superclasses, mode, ...)
@@ -417,59 +428,67 @@ function SUPERCLASSES.__call(superclasses, mode, ...)
     -- recursive
     if mode == "r" then
         class.__superclasses = create_superclasses(class, ...)
-        explore_leaf_dependency_resolve_inheritance(class, class, {})
+
+        local subclasses = {class}
+        local subclasses_n = 1
+        local visited = {}
+        
+        -- this works because of the no redundancy invariant in resolve inheritance, if B and C inherits from A, D inherits from B and C, since no redundancy guarantees D cannot inherit from A, thus BFS works
+        repeat
+            local level_n = subclasses_n
+            local i = 1
+
+            repeat
+                local subclass = subclasses[i]
+                if visited[subclass] then
+                    level_n, subclasses_n = shrink_level(subclasses, i, level_n, subclasses_n)
+                else
+                    visited[subclass] = true
+                    reset_resolve_inheritance(subclass)
+
+                    local subclass_subclass_map = subclass.__subclass_map
+                    local firstclass = next(subclass_subclass_map)
+                    if firstclass == nil then
+                        level_n, subclasses_n = shrink_level(subclasses, i, level_n, subclasses_n)
+                    else
+                        subclasses[i] = firstclass
+
+                        for inner_subclass, v in next, subclass_subclass_map, firstclass do
+                            subclasses_n = subclasses_n + 1
+                            subclasses[subclasses_n] = inner_subclass
+                        end
+
+                        i = i + 1
+                    end
+                end
+
+            until i > level_n
+            
+        until subclasses_n == 0
+
     else
-        -- don't change subclasses
+        -- does not change subclasses
         class.__superclasses = create_superclasses(class, mode, ...)
         reset_resolve_inheritance(class)
     end
 end
 
 
--- lua metamethods are not supported, because cache is lazy, metamethod requires the metamethod to be physically present in cache
 --------------------------------------------------------------------------------------------------------------------------------
 -- Built-in
 --------------------------------------------------------------------------------------------------------------------------------
+-- I explicitly added metamethod support
 -- inherit from Object is opt-in, feel free to make your own life cycle/conventions
 local Object = create_class()
 
 function Object.allocate(class) return {} end
+function Object.construct(instance) end
 
 function Object.new(class, ...)
-    local instance = setmetatable(class:allocate(), class.__cache)
-    instance:construct(...)
+    local cache = class.__cache
+    local instance = setmetatable(cache.allocate(class), cache)
+    cache.construct(instance, ...)
     return instance
-end
-
-local function noop() end
-Object.construct = noop
-Object.destruct = noop
-Object.equals = rawequal
-Object.toString = tostring
-
-function Object:getClass()
-    return self.__class
-end
-
-local MAX_INTEGER = 2^53 - 1
-local next_hashCode = -MAX_INTEGER
-
-function Object:hashCode()
-    local hashCode = self._hashCode
-
-    if hashCode == nil then
-
-        hashCode = next_hashCode
-        self._hashCode = hashCode
-
-        if next_hashCode == MAX_INTEGER then
-            next_hashCode = -MAX_INTEGER
-        else
-            next_hashCode = next_hashCode + 1
-        end
-    end
-
-    return hashCode
 end
 
 --------------------------------------------------------------------------------------------------------------------------------
