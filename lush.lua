@@ -15,8 +15,9 @@ end
 
 local function invalidate_super_cache(class, k, visited)
 
-    invalidate_super_cache_once(class, k)
     visited[class] = true
+    invalidate_super_cache_once(class, k)
+    
 
     for subclass, v in pairs(class.__subclass_map) do
         if not visited[subclass] then
