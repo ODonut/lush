@@ -43,7 +43,7 @@ local function recurse_modify_cache(invalidate_cache, class, k, visited)
             else
                 -- otherwise only invalidate super_cache is necessary
                 -- use a different recursion because invalidate_cache stops recursing
-                invalidate_super_cache(subclass, k, visited)
+                invalidate_super_cache(subclass, k, visited) -- refresh_cache shares this branching because C3 guarantees that the subclass's cache has either this class's entry(because it declared it) or a sibling class's entry, so the root class's entry being changed is never relevant, thus can also just invalidate_super_cache()
             end
 
         end
