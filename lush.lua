@@ -414,63 +414,41 @@ local function reset_resolve_inheritance(class)
     resolve_inheritance(class)
 end
 
-local function shrink_level(subclasses, i, level_n, subclasses_n)
-    subclasses[i] = subclasses[level_n]
-    subclasses[level_n] = subclasses[subclasses_n]
-    subclasses[subclasses_n] = nil
-    return level_n - 1, subclasses_n - 1
-end
 
 function SUPERCLASSES.__call(superclasses, mode, ...)
     local class = superclasses[0]
-    
+
     -- recursive
     if mode == "r" then
         class.__superclasses = create_superclasses(class, ...)
 
         local subclasses = {class}
+        local i = 1
         local subclasses_n = 1
         local visited = {}
-        
+
         -- this works because of the no redundancy invariant in resolve inheritance, if B and C inherits from A, D inherits from B and C, since no redundancy guarantees D cannot inherit from A, thus BFS works
-        repeat
-            local level_n = subclasses_n
-            local i = 1
+        while i <= subclasses_n do
+            local subclass = subclasses[i]
+            i = i + 1
 
-            repeat
-                local subclass = subclasses[i]
-                if visited[subclass] then
-                    level_n, subclasses_n = shrink_level(subclasses, i, level_n, subclasses_n)
-                else
-                    visited[subclass] = true
-                    reset_resolve_inheritance(subclass)
+            if not visited[subclass] then
+                visited[subclass] = true
+                reset_resolve_inheritance(subclass)
 
-                    local subclass_subclass_map = subclass.__subclass_map
-                    local firstclass = next(subclass_subclass_map)
-                    if firstclass == nil then
-                        level_n, subclasses_n = shrink_level(subclasses, i, level_n, subclasses_n)
-                    else
-                        subclasses[i] = firstclass
-
-                        for inner_subclass, v in next, subclass_subclass_map, firstclass do
-                            subclasses_n = subclasses_n + 1
-                            subclasses[subclasses_n] = inner_subclass
-                        end
-
-                        i = i + 1
-                    end
+                for inner_subclass in pairs(subclass.__subclass_map) do
+                    subclasses_n = subclasses_n + 1
+                    subclasses[subclasses_n] = inner_subclass
                 end
-
-            until i > level_n
-            
-        until subclasses_n == 0
-
+            end
+        end
     else
-        -- does not change subclasses
         class.__superclasses = create_superclasses(class, mode, ...)
         reset_resolve_inheritance(class)
     end
 end
+
+
 
 
 --------------------------------------------------------------------------------------------------------------------------------
