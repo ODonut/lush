@@ -80,9 +80,8 @@ local function declare_key(class, k, f)
 
     -- metamethods needs to be physically in cache everytime to work
     if is_metamethod(k) then
-        -- if class itself declared it, it overrides, so the first memoize can be simplified as direct assignment
-        class.__cache[k] = f
-        recurse_modify_cache(refresh_cache, class, k, {})
+
+        refresh_cache(class, k, {})
 
     else
 
@@ -141,18 +140,17 @@ local function resolve_inheritance(class)
     local superclasses = class.__superclasses
     local superclasses_n = #superclasses
 
+    -- invariant: class.__super_cache is set to {[class] = false} before calling resolve_inheritance(class)
     local super_cache = class.__super_cache
 
-    -- book keeping
     if superclasses_n == 0 then
-        super_cache[class] = false
         return
     end
 
     -- invariant: class should not appear as its own superclass
     for i = 1, superclasses_n do
         local superclass = superclasses[i]
-        if superclass == class or superclass.__super_cache[class] ~= nil then
+        if superclass.__super_cache[class] ~= nil then
             error("cyclic inheritance")
         end
     end
@@ -366,7 +364,6 @@ local function create_class(...)
     local class = {
         __declared = {},
         __subclass_map = setmetatable({}, WEAK_K),
-        __super_cache = {},
     }
 
     local cache = setmetatable({__class = class}, MRO_CACHE)
@@ -375,6 +372,7 @@ local function create_class(...)
 
     class.__superclasses = create_superclasses(class, ...)
     class.__orders = {class}
+    class.__super_cache = {[class] = false}
     resolve_inheritance(class)
 
     return setmetatable(class, {__index = cache, __newindex = declare_key})
@@ -407,7 +405,7 @@ local function reset_class(class)
 
     -- replace old orders & super cache, old proxy will not be synced
     class.__orders = {class}
-    class.__super_cache = {}
+    class.__super_cache = {[class] = false}
 end
 
 local function reset_resolve_inheritance(class)
