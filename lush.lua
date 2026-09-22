@@ -37,8 +37,8 @@ local function recurse_modify_cache(invalidate_cache, class, k, visited)
 
             -- didn't override means their cache entry needs to be invalidated
             if subclass.__declared[k] == nil then
-                invalidate_cache(subclass, k, visited)
                 invalidate_super_cache_once(subclass, k)
+                invalidate_cache(subclass, k, visited)
             else
                 -- otherwise only invalidate super_cache is necessary
                 -- use a different recursion because invalidate_cache stops recursing
