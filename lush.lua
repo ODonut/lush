@@ -468,7 +468,11 @@ end
 local Object = create_class()
 
 function Object.allocate(class) return {} end
-function Object.construct(instance) end
+
+local noop = function() end
+Object.construct = noop
+Object.destruct = noop
+
 
 function Object.new(class, ...)
     local cache = class.__cache
