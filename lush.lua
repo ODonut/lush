@@ -365,11 +365,6 @@ local function create_superclasses(class, ...)
     return setmetatable({[0] = class, ...}, SUPERCLASSES)
 end
 
--- new is special, since __call use it
-local function create_instance(class, ...)
-    return class:new(...)
-end
-
 local function create_class(...)
     local class = {
         __declared = {},
@@ -385,7 +380,7 @@ local function create_class(...)
     class.__super_cache = {[class] = false}
     resolve_inheritance(class)
 
-    return setmetatable(class, {__index = cache, __newindex = declare_key, __call = create_instance})
+    return setmetatable(class, {__index = cache, __newindex = declare_key})
 end
 
 --------------------------------------------------------------------------------------------------------------------------------
