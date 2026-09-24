@@ -2,32 +2,36 @@
 -- version: 1.0
 
 -- this is necessary for every single subclass, because they might call super() and get proxies at any stage in the MRO, and subsequent access on the proxy might cache something.
-local function invalidate_super_cache_once(class, k)
+local function invalidate_super_cache_once(class, k, root)
     local orders = class.__orders
     local super_cache = class.__super_cache
 
+    local proxy = super_cache[root]
+
     -- proxies only appear from 1 to #orders - 2, since the last one point to nil, and second last one point to last one's __declared
-    for i = 1, #orders - 2 do
+    -- exploiting the fact that proxy may store __i, since only super proxies prior to the root's next super proxy and including root's own super proxy needs invalidation (super_cache[root] gets next proxy after root, so minus 1 is necessary so that the upper bound of the loop includes root's proxy but not touch the proxy after it)
+    -- this can be optimzied since if root has at least 1 superclass, it will be guaranteed that proxy after root cannot be false, and if root has at least 2 superclasses, it will be guranteed that the proxy after root is a real proxy with __i, not __declared, but based on my benchmarks the difference is negligible so I won't duplicate the code here.
+    for i = 1, (proxy and proxy.__i or #orders - 1) - 1 do
         -- invariant: proxies always exist from 1 to #orders - 2
         super_cache[orders[i]][k] = nil
     end
 end
 
-local function invalidate_super_cache(class, k, visited)
+local function invalidate_super_cache(class, k, root, visited)
 
     visited[class] = true
-    invalidate_super_cache_once(class, k)
+    invalidate_super_cache_once(class, k, root)
     
 
     for subclass, v in pairs(class.__subclass_map) do
         if not visited[subclass] then
-            invalidate_super_cache(subclass, k, visited)
+            invalidate_super_cache(subclass, k, root, visited)
         end
     end
 end
 
 -- based on my benchmarks, recursion is faster than another breadth-first approach
-local function recurse_modify_cache(invalidate_cache, class, k, visited)
+local function recurse_modify_cache(invalidate_cache, class, k, root, visited)
 
     -- track visited in case a child class inherits from 2 parent classes that both inherit from the same grandparent class, where with DFS, the child may be visited twice 
     visited[class] = true
@@ -38,21 +42,21 @@ local function recurse_modify_cache(invalidate_cache, class, k, visited)
 
             -- didn't override means their cache entry needs to be invalidated
             if subclass.__declared[k] == nil then
-                invalidate_super_cache_once(subclass, k)
-                invalidate_cache(subclass, k, visited)
+                invalidate_super_cache_once(subclass, k, root)
+                invalidate_cache(subclass, k, root, visited)
             else
                 -- otherwise only invalidate super_cache is necessary
                 -- use a different recursion because invalidate_cache stops recursing
-                invalidate_super_cache(subclass, k, visited) -- refresh_cache shares this branching because C3 guarantees that the subclass's cache has either this class's entry(because it declared it) or a sibling class's entry, so the root class's entry being changed is never relevant, thus can also just invalidate_super_cache()
+                invalidate_super_cache(subclass, k, root, visited) -- refresh_cache shares this branching because C3 guarantees that the subclass's cache has either this class's entry(because it declared it) or a sibling class's entry, so the root class's entry being changed is never relevant, thus can also just invalidate_super_cache()
             end
 
         end
     end
 end
 
-local function invalidate_cache(class, k, visited)
+local function invalidate_cache(class, k, root, visited)
     class.__cache[k] = nil
-    recurse_modify_cache(invalidate_cache, class, k, visited)
+    recurse_modify_cache(invalidate_cache, class, k, root, visited)
 end
 
 local function memoize(cache, k, orders, i)
@@ -66,9 +70,9 @@ local function memoize(cache, k, orders, i)
     return nil
 end
 
-local function refresh_cache(class, k, visited)
+local function refresh_cache(class, k, root, visited)
     memoize(class.__cache, k, class.__orders, 1)
-    recurse_modify_cache(refresh_cache, class, k, visited)
+    recurse_modify_cache(refresh_cache, class, k, root, visited)
 end
 
 local function is_metamethod(k)
@@ -82,11 +86,11 @@ local function declare_key(class, k, f)
     -- metamethods needs to be physically in cache everytime to work
     if is_metamethod(k) then
 
-        refresh_cache(class, k, {})
+        refresh_cache(class, k, class, {})
 
     else
 
-        invalidate_cache(class, k, {})
+        invalidate_cache(class, k, class, {})
     end
 end
 
@@ -361,6 +365,11 @@ local function create_superclasses(class, ...)
     return setmetatable({[0] = class, ...}, SUPERCLASSES)
 end
 
+-- new is special, since __call use it
+local function create_instance(class, ...)
+    return class:new(...)
+end
+
 local function create_class(...)
     local class = {
         __declared = {},
@@ -376,7 +385,7 @@ local function create_class(...)
     class.__super_cache = {[class] = false}
     resolve_inheritance(class)
 
-    return setmetatable(class, {__index = cache, __newindex = declare_key})
+    return setmetatable(class, {__index = cache, __newindex = declare_key, __call = create_instance})
 end
 
 --------------------------------------------------------------------------------------------------------------------------------
