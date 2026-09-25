@@ -329,6 +329,7 @@ local function resolve_inheritance(class)
 
 
     local offset = orders_n - last_superclass_orders_n
+    local leftovers_n = orders_n - 2
 
     for i = last_superclass_orders_n - 2, 1, -1 do
         
@@ -340,17 +341,17 @@ local function resolve_inheritance(class)
             super_cache[superclass] = last_superclass_super_cache[superclass]
 
         else
-
             -- handle j since superclass is already grabbed
             super_cache[superclass] = create_proxy(orders, j + 1)
 
-            -- create necessary new proxies for everything prior to j, since everything after j is successfully shared
-            for k = 2, j - 1 do
-                super_cache[orders[k]] = create_proxy(orders, k + 1)
-            end
+            leftovers_n = j - 1
 
-            return
         end
+    end
+
+    -- create necessary new proxies for everything prior to leftovers_n, since everything after leftovers_n is handled
+    for i = 2, leftovers_n do
+        super_cache[orders[i]] = create_proxy(orders, i + 1)
     end
 
 end
