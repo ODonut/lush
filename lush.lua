@@ -459,20 +459,16 @@ end
 
 
 
-
 --------------------------------------------------------------------------------------------------------------------------------
 -- Built-in
 --------------------------------------------------------------------------------------------------------------------------------
 -- I explicitly added metamethod support
--- inherit from Object is opt-in, feel free to make your own life cycle/conventions
+
+
 local Object = create_class()
 
 function Object.allocate(class) return {} end
-
-local noop = function() end
-Object.construct = noop
-Object.destruct = noop
-
+function Object.construct(instance) end
 
 function Object.new(class, ...)
     local cache = class.__cache
