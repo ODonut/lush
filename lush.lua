@@ -466,6 +466,11 @@ end
 --------------------------------------------------------------------------------------------------------------------------------
 -- I explicitly added metamethod support, so it works
 
+---@class Object
+---@field allocate fun(class: Object): table
+---@field construct fun(instance: Object)
+---@field new fun(class: Object, ...: any): Object
+---@field [any] any -- silence the linter
 local Object = create_class()
 
 function Object.allocate(class) return {} end
