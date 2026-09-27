@@ -104,7 +104,7 @@ local MRO_PROXY = {
 -- false mean end of MRO, nil mean not found in MRO
 -- both super(instance, currentclass) and super(class, currentclass) works
 -- you can also use super() as instanceof via super(self, currentclass) ~= nil
-local function next_superclass(instance, currentclass)
+local function next_superclass(currentclass, instance)
     return instance.__class.__super_cache[currentclass]
 end
 
@@ -423,7 +423,6 @@ local function reset_resolve_inheritance(class)
     resolve_inheritance(class)
 end
 
-
 function SUPERCLASSES.__call(superclasses, mode, ...)
     local class = superclasses[0]
 
@@ -462,8 +461,7 @@ end
 --------------------------------------------------------------------------------------------------------------------------------
 -- Built-in
 --------------------------------------------------------------------------------------------------------------------------------
--- I explicitly added metamethod support
-
+-- I explicitly added metamethod support, so it works
 
 local Object = create_class()
 
