@@ -1,6 +1,11 @@
 -- library: lush
 -- version: 1.0
 
+-- this is necessary in some places, because in luaJIT, cdata can trigger __eq when compared to nil
+local function is_nil(v)
+    return rawequal(v, nil)
+end
+
 -- this is necessary for every single subclass, because they might call super() and get proxies at any stage in the MRO, and subsequent access on the proxy might cache something.
 local function invalidate_super_cache_once(class, k, root)
     local orders = class.__orders
@@ -41,7 +46,7 @@ local function recurse_modify_cache(invalidate_cache, class, k, root, visited)
         if not visited[subclass] then
 
             -- didn't override means their cache entry needs to be invalidated
-            if subclass.__declared[k] == nil then
+            if is_nil(subclass.__declared[k]) then
                 invalidate_super_cache_once(subclass, k, root)
                 invalidate_cache(subclass, k, root, visited)
             else
@@ -62,7 +67,7 @@ end
 local function memoize(cache, k, orders, i)
     for j = i, #orders do
         local v = orders[j].__declared[k]
-        if v ~= nil then
+        if not is_nil(v) then
             cache[k] = v
             return v
         end
@@ -134,7 +139,7 @@ local function warm_cache_metamethod(cache, orders, orders_n)
     -- IMPORTANT: includes class itself, resolve_inheritance populates metamethods to cache
     for i = 1, orders_n do
         for k, v in pairs(orders[i].__declared) do
-            if is_metamethod(k) and rawget(cache, k) == nil then
+            if is_metamethod(k) and is_nil(rawget(cache, k)) then
                 cache[k] = v
             end
         end
@@ -401,7 +406,7 @@ local function reset_class(class)
     local cache_index = cache.__index -- in case you made __index a metamethod
 
     for k, v in pairs(cache) do
-        if declared[k] == nil then
+        if is_nil(declared[k]) then
             -- if declared directly, cache entry is fine
             cache[k] = nil
         end
@@ -469,17 +474,19 @@ end
 ---@class Object
 ---@field allocate fun(class: Object): table
 ---@field construct fun(instance: Object)
+---@field initialize fun(instance: Object, ...: any)
 ---@field new fun(class: Object, ...: any): Object
 ---@field [any] any -- silence the linter
 local Object = create_class()
 
-function Object.allocate(class) return {} end
+function Object.allocate(class) return setmetatable({}, class.__cache) end
 function Object.construct(instance) end
+function Object.initialize(instance) end
 
 function Object.new(class, ...)
-    local cache = class.__cache
-    local instance = setmetatable(cache.allocate(class), cache)
-    cache.construct(instance, ...)
+    local instance = class:allocate()
+    instance:construct()
+    instance:initialize(...)
     return instance
 end
 
