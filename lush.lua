@@ -398,14 +398,17 @@ local function reset_class(class)
     -- reset cache, need to empty because instances' metatable is cache, can't just replace
     local declared = class.__declared
     local cache = class.__cache
+    local cache_index = cache.__index -- in case you made __index a metamethod
+
     for k, v in pairs(cache) do
         if declared[k] == nil then
             -- if declared directly, cache entry is fine
             cache[k] = nil
         end
     end
+
     cache.__class = class
-    cache.__index = cache
+    cache.__index = cache_index
 
     -- remove all old relationship
     local superclasses = class.__superclasses
