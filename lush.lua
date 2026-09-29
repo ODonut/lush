@@ -472,17 +472,16 @@ end
 -- I explicitly added metamethod support, so it works
 
 ---@class Object
----@field allocate fun(class: Object): table
----@field construct fun(instance: Object)
----@field initialize fun(instance: Object, ...: any)
----@field new fun(class: Object, ...: any): Object
----@field [any] any -- silence the linter
 local Object = create_class()
 
+---@param class Object
+---@return Object
 function Object.allocate(class) return setmetatable({}, class.__cache) end
-function Object.construct(instance) end
-function Object.initialize(instance) end
+function Object:construct() end
+function Object:initialize(...) end
 
+---@param class Object
+---@return Object
 function Object.new(class, ...)
     local instance = class:allocate()
     instance:construct()
