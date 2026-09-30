@@ -107,7 +107,7 @@ local MRO_PROXY = {
 }
 
 -- false mean end of MRO, nil mean not found in MRO
--- both super(instance, currentclass) and super(class, currentclass) works
+-- both super(currentclass, instance) and super(currentclass, class) works
 -- you can also use super() as instanceof via super(self, currentclass) ~= nil
 local function next_superclass(currentclass, instance)
     return instance.__class.__super_cache[currentclass]
