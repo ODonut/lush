@@ -137,9 +137,9 @@ end
 -- invariant: cache is empty when this run
 local function warm_cache_metamethod(cache, orders, orders_n)
     -- IMPORTANT: includes class itself, resolve_inheritance populates metamethods to cache
-    for i = 1, orders_n do
+    for i = orders_n, 1, -1 do
         for k, v in pairs(orders[i].__declared) do
-            if is_metamethod(k) and is_nil(rawget(cache, k)) then
+            if is_metamethod(k) then
                 cache[k] = v
             end
         end
@@ -471,8 +471,39 @@ end
 --------------------------------------------------------------------------------------------------------------------------------
 -- I explicitly added metamethod support, so it works
 
+-- invariant: instance does not have the same field directly, and is under standard metatable, this no longer works for cdata metatype, because getmetatable returns a string of the metatype
+-- I don't really have a workaround for it, __metatable does not work since getmetatable(cdata) always return ffi, so you have to write a separate dispatch for each one
+-- exploiting the fact that instance's metatable for Object is directly cache itself, so no extra information needs to be stored
+local function dispatch_index(instance, k)
+    local v = getmetatable(instance)[k]
+    if type(v) == "table" then
+        local get = v.get
+        if type(get) == "function" then
+            return get(instance)
+        end
+    end
+    return v
+end
+
+local function dispatch_newindex(instance, k, x)
+    local v = getmetatable(instance)[k]
+    if type(v) == "table" then
+        local set = v.set
+        if type(set) == "function" then
+            set(instance, x)
+            return
+        end
+    end
+    rawset(instance, k, v)
+end
+
+
 ---@class Object
 local Object = create_class()
+
+-- accessor sugar, works across inheritance unless you override __index or __newindex
+Object.__index = dispatch_index
+Object.__newindex = dispatch_newindex
 
 ---@param class Object
 ---@return Object
