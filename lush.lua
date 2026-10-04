@@ -1,7 +1,7 @@
 -- library: lush
 -- version: 1.0
 
--- this is necessary in some places, because in luaJIT, cdata can trigger __eq when compared to nil
+-- normally lua needs two tables to have the same __eq in their metatable, however this is necessary in because in luaJIT, cdata can trigger __eq when compared to nil
 local function is_nil(v)
     return rawequal(v, nil)
 end
@@ -16,6 +16,7 @@ local function invalidate_super_cache_once(class, k, root)
     -- proxies only appear from 1 to #orders - 2, since the last one point to nil, and second last one point to last one's __declared
     -- exploiting the fact that proxy may store __i, since only super proxies prior to the root's next super proxy and including root's own super proxy needs invalidation (super_cache[root] gets next proxy after root, so minus 1 is necessary so that the upper bound of the loop includes root's proxy but not touch the proxy after it)
     -- this can be optimzied since if root has at least 1 superclass, it will be guaranteed that proxy after root cannot be false, and if root has at least 2 superclasses, it will be guranteed that the proxy after root is a real proxy with __i, not __declared, but based on my benchmarks the difference is negligible so I won't duplicate the code here.
+    -- this is not a ternary operator, if either one of proxy or proxy.__i is falsey(since __declared has no __i), #orders - 1 gets chosen
     for i = 1, (proxy and proxy.__i or #orders - 1) - 1 do
         -- invariant: proxies always exist from 1 to #orders - 2
         super_cache[orders[i]][k] = nil
@@ -35,7 +36,6 @@ local function invalidate_super_cache(class, k, root, visited)
     end
 end
 
--- based on my benchmarks, recursion is faster than another breadth-first approach
 local function recurse_modify_cache(invalidate_cache, class, k, root, visited)
 
     -- track visited in case a child class inherits from 2 parent classes that both inherit from the same grandparent class, where with DFS, the child may be visited twice 
@@ -84,7 +84,7 @@ local function is_metamethod(k)
     return type(k) == "string" and k:sub(1, 2) == "__"
 end
 
--- don't reassign internals like __class, __declared, etc
+-- don't reassign internals like __class, __declared, __i, etc
 local function declare_key(class, k, f)
     class.__declared[k] = f
 
@@ -99,18 +99,31 @@ local function declare_key(class, k, f)
     end
 end
 
+
+local WEAK_KV = {__mode = "kv"}
+
+local proxy_self_cache = setmetatable({}, WEAK_KV)
+
+-- call_method is not coroutine safe, use manual super(currentclass, instance).method(instance, ...) if it matters
+local function call_method(proxy, k, ...)
+    return proxy[k](proxy_self_cache[proxy], ...)
+end
+
 -- class.__orders might be reassigned, proxy won't sync, be aware
 local MRO_PROXY = {
     __index = function(proxy, k)
         return memoize(proxy, k, proxy.__orders, proxy.__i)
-    end
+    end,
+    __call = call_method,
 }
 
 -- false mean end of MRO, nil mean not found in MRO
 -- both super(currentclass, instance) and super(currentclass, class) works
 -- you can also use super() as instanceof via super(currentclass, instance) ~= nil
 local function next_superclass(currentclass, instance)
-    return instance.__class.__super_cache[currentclass]
+    local proxy = instance.__class.__super_cache[currentclass]
+    proxy_self_cache[proxy] = instance
+    return proxy
 end
 
 -- inclusive i
@@ -126,15 +139,19 @@ local function remove_at(array, i, n)
 	return n - 1
 end
 
-local function count_tail(superclass, tail_map)
-    local count = tail_map[superclass]
-    if not count then
-        count = 0
+local function count_tails(superclass_orders, superclass_orders_n, tail_map)
+    for i = 2, superclass_orders_n do
+        local superclass = superclass_orders[i]
+        local count = tail_map[superclass]
+        if count then
+            tail_map[superclass] = count + 1
+        else
+            tail_map[superclass] = 1
+        end
     end
-    tail_map[superclass] = count + 1
 end
 
--- invariant: cache is empty when this run
+-- assumption: cache is empty when this run, though it will still work if cache is not empty
 local function warm_cache_metamethod(cache, orders, orders_n)
     -- IMPORTANT: includes class itself, resolve_inheritance populates metamethods to cache
     for i = orders_n, 1, -1 do
@@ -230,17 +247,13 @@ local function resolve_inheritance(class)
 
         local superclass_orders = superclass.__orders
 
-        for j = 2, #superclass_orders do
-            count_tail(superclass_orders[j], tail_map)
-        end
+        count_tails(superclass_orders, #superclass_orders, tail_map)
 
         superclasses_orders_cursor_map[superclass_orders] = 1
         superclasses_orders[i] = superclass_orders
     end
 
-    for i = 2, superclasses_n do
-        count_tail(superclasses[i], tail_map)
-    end
+    count_tails(superclasses, superclasses_n, tail_map)
 
     superclasses_orders[superclasses_orders_n] = superclasses
     
@@ -375,9 +388,26 @@ local function create_superclasses(class, ...)
     return setmetatable({[0] = class, ...}, SUPERCLASSES)
 end
 
+-- syntax sugar for __new
+local function create_instance(class, ...)
+    return class:__new(...)
+end
+
+local DECLARED = {
+    __call = call_method
+}
+
+local CLASS = {
+    __index = function(class, k)
+        return class.__cache[k]
+    end,
+    __newindex = declare_key,
+    __call = create_instance,
+}
+
 local function create_class(...)
     local class = {
-        __declared = {},
+        __declared = setmetatable({}, DECLARED),
         __subclass_map = setmetatable({}, WEAK_K),
     }
 
@@ -390,7 +420,7 @@ local function create_class(...)
     class.__super_cache = {[class] = false}
     resolve_inheritance(class)
 
-    return setmetatable(class, {__index = cache, __newindex = declare_key})
+    return setmetatable(class, CLASS)
 end
 
 --------------------------------------------------------------------------------------------------------------------------------
@@ -401,19 +431,14 @@ end
 local function reset_class(class)
 
     -- reset cache, need to empty because instances' metatable is cache, can't just replace
-    local declared = class.__declared
     local cache = class.__cache
-    local cache_index = cache.__index -- in case you made __index a metamethod
 
     for k, v in pairs(cache) do
-        if is_nil(declared[k]) then
-            -- if declared directly, cache entry is fine
-            cache[k] = nil
-        end
+        cache[k] = nil
     end
 
     cache.__class = class
-    cache.__index = cache_index
+    cache.__index = cache -- this is fine because in resolve_inheritance, if there is a __index declared, warm_cache_metamethod will override __index
 
     -- remove all old relationship
     local superclasses = class.__superclasses
@@ -472,52 +497,85 @@ end
 -- I explicitly added metamethod support, so it works
 
 -- invariant: instance does not have the same field directly, and is under standard metatable, this no longer works for cdata metatype, because getmetatable returns a string of the metatype
--- I don't really have a workaround for it, __metatable does not work since getmetatable(cdata) always return ffi, so you have to write a separate dispatch for each one
+-- I don't really have a workaround for it, __metatable does not work since getmetatable(cdata) always return ffi, so you have to manually figure out it by capturing an upvalue
 -- exploiting the fact that instance's metatable for Object is directly cache itself, so no extra information needs to be stored
-local function dispatch_index(instance, k)
-    local v = getmetatable(instance)[k]
+
+local function dispatch_index(cache, instance, k)
+    local v = cache[k]
     if type(v) == "table" then
-        local get = v.get
-        if type(get) == "function" then
-            return get(instance)
+        local get = v.__get
+        if is_nil(get) then
+            if not is_nil(v.__set) then
+                error("property " .. tostring(k) .. " is set only")
+            end
+        else
+            if type(get) == "function" then
+                return get(instance)
+            else
+                error("invalid non-function getter")
+            end
         end
     end
     return v
 end
 
-local function dispatch_newindex(instance, k, x)
-    local v = getmetatable(instance)[k]
+local function dispatch_newindex(cache,instance, k, x)
+    local v = cache[k]
     if type(v) == "table" then
-        local set = v.set
-        if type(set) == "function" then
-            set(instance, x)
-            return
+        local set = v.__set
+        if is_nil(set) then
+            if not is_nil(v.__get) then
+                error("property " .. tostring(k) .. " is get only")
+            end
+        else
+            if type(set) == "function" then
+                set(instance, x)
+                return
+            else
+                error("invalid non-function setter")
+            end
         end
+
     end
-    rawset(instance, k, v)
+    rawset(instance, k, x)
 end
 
-
----@class Object
+-- root Object class, opt-in
 local Object = create_class()
 
 -- accessor sugar, works across inheritance unless you override __index or __newindex
-Object.__index = dispatch_index
-Object.__newindex = dispatch_newindex
+function Object.__index(instance, k)
+    return dispatch_index(getmetatable(instance), instance, k)
+end
 
----@param class Object
----@return Object
-function Object.allocate(class) return setmetatable({}, class.__cache) end
-function Object:construct() end
-function Object:initialize(...) end
+function Object.__newindex(instance, k, x)
+   return dispatch_newindex(getmetatable(instance), instance, k, x) 
+end
 
----@param class Object
----@return Object
-function Object.new(class, ...)
-    local instance = class:allocate()
-    instance:construct()
-    instance:initialize(...)
+function Object.__init(instance) end
+
+function Object.__new(class, ...)
+    local cache = class.__cache
+    local instance = setmetatable({}, cache)
+    cache.__init(instance, ...)
     return instance
+end
+
+--------------------------------------------------------------------------------------------------------------------------------
+-- Cdata work around
+--------------------------------------------------------------------------------------------------------------------------------
+-- if you made __cache the metatype table of your ctype, do not use ctype() directly, because the name __new lush uses is its own initialization metamethod in cdata, instead use ffi.new(ctype) which ignores __new
+
+local function curry_dispatch_index(cache)
+    return function(instance, k)
+        return dispatch_index(cache, instance, k)
+    end
+end
+
+local function curry_dispatch_newindex(cache)
+    return function(instance, k, x)
+        return dispatch_newindex(cache, instance, k, x)
+    end
 end
 
 --------------------------------------------------------------------------------------------------------------------------------
@@ -528,4 +586,7 @@ return {
     class = create_class,
     super = next_superclass,
     Object = Object,
+
+    cd_index = curry_dispatch_index,
+    cd_newindex = curry_dispatch_newindex,
 }
