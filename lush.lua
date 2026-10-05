@@ -578,6 +578,16 @@ local function curry_dispatch_newindex(cache)
     end
 end
 
+local success, ffi = pcall(require, "ffi")
+
+local function curry_new(ctype, ...)
+    return function(class, ...)
+        local instance = ffi.new(ctype)
+        instance:__init(...)
+        return instance
+    end
+end
+
 --------------------------------------------------------------------------------------------------------------------------------
 -- Export
 --------------------------------------------------------------------------------------------------------------------------------
@@ -589,4 +599,5 @@ return {
 
     cd_index = curry_dispatch_index,
     cd_newindex = curry_dispatch_newindex,
+    c_new = curry_new,
 }
