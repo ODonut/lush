@@ -161,7 +161,7 @@ Be careful with `__index` and `__newindex`. If you declare `__index` as a functi
 
 ## Structs (LuaJIT only)
 
-`struct(field_map, ...)` creates a class whose instances are FFI `cdata`. It requires LuaJIT's `ffi` module.
+`struct(schema, ...)` creates a class whose instances are FFI `cdata`. It requires LuaJIT's `ffi` module.
 
 ```lua
 local struct = lush.struct
@@ -185,7 +185,7 @@ print(p:length())  --> 5
 
 ### Field types
 
-Each value in `field_map` can be:
+Each value in `schema` can be:
 
 - a string in LuaJIT ctype syntax (`"int"`, `"double"`, `"int(*)[5]"`)
 - an existing ctype object (from `ffi.typeof`)
@@ -197,8 +197,8 @@ Fields from all struct ancestors are merged, with the nearest class winning on n
 
 | Key | Meaning |
 |-----|---------|
-| `field_map[0] = true` | Declare the struct anonymously instead of as a named, forward-declared struct. Only use this if the struct doesn't need self or mutual references. |
-| `field_map[1] = "..."` | An attribute string appended after the struct body, e.g. `"__attribute__((packed))"`. |
+| `schema[0] = true` | Declare the struct anonymously instead of as a named, forward-declared struct. Only use this if the struct doesn't need self or mutual references. |
+| `schema[1] = "..."` | An attribute string appended after the struct body, e.g. `"__attribute__((packed))"`. |
 
 ### Pointers and recursive structs
 
@@ -208,7 +208,7 @@ Calling a named struct class returns its C type name, with any arguments appende
 local A = struct({}, Object)
 local B = struct({ a_ptr = A("*") }, Object)
 
-A.__field_map.b_ptr = B("*")   -- legal because neither is in use yet
+A.__schema.b_ptr = B("*")   -- legal because neither is in use yet
 
 local a = A:new()
 a.b_ptr = B:new()
@@ -239,7 +239,7 @@ The underlying C struct and metatype are created lazily, the first time `__metat
 
 LuaJIT forbids changing a metatype's metatable after it's bound, which is why everything is copied into the cache up front. Define all methods and metamethods **before** the first `new`.
 
-Note that a struct's `field_map` is internal data. Mutating it after the struct (or any struct that embeds it) has been evaluated is not supported.
+Note that a struct's `schema` is internal data. Mutating it after the struct (or any struct that embeds it) has been evaluated is not supported.
 
 ## LuaJIT and `nil` comparison
 
@@ -253,14 +253,14 @@ In LuaJIT, `cdata` can trigger `__eq` when compared with any value, including `n
 | `lush.super(currentclass, instance_or_class)` | Next entry in the MRO after `currentclass` |
 | `lush.orphan(class, ...)` | Drop parents and optionally attach new ones, rebuilding descendants |
 | `lush.Object` | Base class providing `new` and an empty `init` |
-| `lush.struct(field_map, ...)` | Create an FFI struct class (LuaJIT only) |
+| `lush.struct(schema, ...)` | Create an FFI struct class (LuaJIT only) |
 | `Object.new(class, ...)` | Create an instance and call `init` |
 | `Object.init(instance, ...)` | Constructor hook, empty by default |
 
 ## Behavior notes and limitations
 
 - **`nil` is never cached.** A missing key is looked up through the whole MRO every time. Make sure instance fields are initialized in `init` if you test for them often.
-- **Reserved names.** Keys such as `__class`, `__declared`, `__cache`, `__orders`, `__super_cache`, `__subclass_map`, `__superclasses`, `__field_map`, and `__metatype` are used internally. Don't assign to them.
+- **Reserved names.** Keys such as `__class`, `__declared`, `__cache`, `__orders`, `__super_cache`, `__subclass_map`, `__superclasses`, `__schema`, and `__metatype` are used internally. Don't assign to them.
 - **Internals are not a public API.** In particular, the cache is derived data; writing to it with `rawset` is unsupported, and it is rebuilt (not restored) when `orphan` rolls back.
 - **Subclass tracking is weak.** Classes are held weakly by their parents, so unreferenced subclasses can be garbage collected.
 - **Don't recurse through `Object.new` with a different class** in a struct: struct `new` is not polymorphic, and the class passed in is ignored.
