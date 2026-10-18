@@ -56,15 +56,17 @@ local function recurse_modify_cache(invalidate_cache, class, k, root, visited)
 
     for subclass, v in pairs(class.__subclass_map) do
 
-        -- guard for struct class
-        if getmetatable(subclass) == IN_USE_STRUCT then
-            error("ancestor classes cannot be modified(unless has no effect) if a descendant is a struct class")
-        end
-
         if not visited[subclass] then
 
             -- didn't override means their cache entry needs to be invalidated
             if is_nil(subclass.__declared[k]) then
+
+                -- guard for struct class
+                if getmetatable(subclass) == IN_USE_STRUCT then
+                    error("ancestor classes cannot be modified(unless has no effect) if a descendant is a struct class", 0)
+                end
+
+
                 invalidate_super_cache_once(subclass, k, root)
                 invalidate_cache(subclass, k, root, visited)
             else
@@ -436,6 +438,7 @@ local function resolve_inheritance_warm_cache_metamethod(class)
     warm_cache_metamethod(class.__cache, class.__orders)
 end
 
+-- making a plain class inherit from a struct is not guarded, but not supported, which the class:new() behavior is undefined
 -- creates a new class without inheriting from Object
 local function create_class(...)
     local class = {
@@ -487,18 +490,17 @@ local function reset_class(class)
 end
 
 local function reset_resolve_inheritance_warm_cache_metamethod(class)
-
-    -- struct in use guard
-    if getmetatable(class) == IN_USE_STRUCT then
-        error("struct/ancestor class cannot have inheritance changed after in use", 0)
-    end
-    
-
     reset_class(class)
     resolve_inheritance_warm_cache_metamethod(class)
 end
 
 local function store_visited_rollback(class, visited)
+
+    -- struct in use guard
+    if getmetatable(class) == IN_USE_STRUCT then
+        error("struct/ancestor class cannot have inheritance changed after in use", 0)
+    end
+
     local orders = class.__orders
     orders.__super_cache = class.__super_cache -- temporary, removed later
     visited[class] = orders
@@ -637,8 +639,16 @@ end
 -- extension for luajit's cdata
 local success, ffi = pcall(require, "ffi")
 
-local function to_struct_name(class)
-    return "struct _" .. tostring(class):match("table: (%w+)") -- table: 0xabcd
+local STRUCT_NAME_PREFIX = "struct LUSH_"
+local STRUCT_NAME_COUNT = 0
+
+local function resolve_struct_name(class)
+    STRUCT_NAME_COUNT = STRUCT_NAME_COUNT + 1
+
+    local struct_name = STRUCT_NAME_PREFIX .. STRUCT_NAME_COUNT
+    class.__struct_name = struct_name
+
+    return struct_name
 end
 
 --[[
@@ -668,10 +678,7 @@ a.b_ptr.a_ptr = a
 
 -- not recommended to pcall, but it will work because redundant cdef of incomplete struct declaration is harmless in C
 -- if you need additional functionality, you can override new() with custom logic directly.
-local function resolve_struct(class)
-    -- remove the STRUCT mt
-    setmetatable(class, nil)
-
+local function resolve_struct_metatype(class)
     local cache = class.__cache
 
     local accumulated_schema = {}
@@ -693,9 +700,9 @@ local function resolve_struct(class)
         end
     end
 
-    
-    local anonymous = accumulated_schema[0]
-    local attribute = accumulated_schema[1]
+    local schema = class.__schema
+    local anonymous = schema[0] -- metadata are not inherited
+    local attribute = schema[1]
 
     -- avoid interfering with pairs()
     accumulated_schema[0] = nil
@@ -705,7 +712,6 @@ local function resolve_struct(class)
     local keys = {}
     local keys_n = 0
 
-    local array_map = {}
     local ctype_map = {}
 
     local struct_name = "struct "
@@ -714,7 +720,7 @@ local function resolve_struct(class)
     -- if you guarantees it can be expressed anonymously, toggle it in [0]
 
     if not anonymous then -- [0] may store a boolean to toggle anonymous behavior
-        struct_name = to_struct_name(class)
+        struct_name = class.__struct_name
         -- cdef is already done in create_struct
     end
 
@@ -779,7 +785,7 @@ local function resolve_struct(class)
         array[n] = " "
 
         n = n + 1
-        array[n] = array_map[k] or k
+        array[n] = k
 
         n = n + 1
         array[n] = ";"
@@ -796,35 +802,67 @@ local function resolve_struct(class)
     local metatype = ffi.metatype(ffi.typeof(table.concat(array), unpack(ctypes, 1, ctypes_n)), cache)
     class.__metatype = metatype
 
+    return metatype
+end
+
+
+local STRUCT
+
+local function resolve_struct(class)
+    -- remove the STRUCT mt
+    setmetatable(class, nil)
+
+    local success, metatype = pcall(resolve_struct_metatype, class)
+    if not success then
+        reset_cache(class) -- not warming is fine in this case, because resovle_struct_metatype will copy everything into cache if called again later
+
+        setmetatable(class, STRUCT)
+        error(metatype, 0)
+    end
+    
     -- freeze class, internals are still mutable since in lua it is difficult to enforce immutability, but it's not supported
     setmetatable(class, IN_USE_STRUCT)
 
     return metatype
 end
 
+-- class's metatable should currently be STRUCT
 local function resolve_struct_new(class)
     local cache = class.__cache
     local init = cache.init -- struct is immutable after in-use, so this is fine
 
     local metatype
+    local declared = class.__declared
+    local original_new = declared.new
+    local new = original_new
 
-    local function new(inner_class, ...)
-        local instance = metatype()
-        init(instance, ...)
-        return instance
+    if not original_new then
+        new = function(inner_class, ...)
+            local instance = metatype()
+            init(instance, ...)
+            return instance
+        end
+
+        declared.new = new
     end
 
-    class.new = new
-    metatype = resolve_struct(class)
+    local success
+    success, metatype = pcall(resolve_struct, class)
+
+    if not success then
+        declared.new = original_new
+        error(metatype, 0)
+    end
 
     return new, metatype
 end
 
 local function concat_struct_name(class, ...)
-    if class.__schema[0] then -- anonymous
+    local struct_name = rawget(class, "__struct_name")
+    if not struct_name then
         return nil
     end
-    return table.concat({to_struct_name(class), ...})
+    return table.concat({struct_name, ...})
 end
 
 -- local declared at top
@@ -836,12 +874,13 @@ IN_USE_STRUCT = {
     __call = concat_struct_name
 }
 
-local STRUCT = {
+STRUCT = {
     __index = function(class, k)
+        local super_cache = class.__super_cache
         if k == "__metatype" then
             local metatype
 
-            if class.__super_cache[Object] == nil then
+            if super_cache[Object] == nil then
                 metatype = resolve_struct(class)
             else
                 local new
@@ -849,6 +888,18 @@ local STRUCT = {
             end
 
             return metatype
+        elseif k == "new" then
+
+            -- custom new cannot be inherited, otherwise if a struct inherits from another struct, it will use its superclass struct's new, which is strange
+            local new = class.__declared.new
+            if new then
+                return new
+            end
+
+            if super_cache[Object] ~= nil then
+                return resolve_struct_new(class)
+            end
+
         end
 
         return class.__cache[k]
@@ -859,25 +910,16 @@ local STRUCT = {
     __call = concat_struct_name,
 }
 
+
 local function create_struct(schema, ...)
     local class = create_class(...)
     setmetatable(class, nil) -- remove CLASS mt
 
     class.__schema = schema
 
-    if class.__super_cache[Object] ~= nil then -- inherits Object
-
-        -- this is not polymorphic, inner_class is disposed
-        function class.new(inner_class, ...)
-            return resolve_struct_new(class)(class, ...)
-        end
-    end
-
     local anonymous = schema[0]
-
     if not anonymous then
-        local struct_name = to_struct_name(class)
-        ffi.cdef(struct_name) -- luajit allows omitting trailing ;
+        ffi.cdef(resolve_struct_name(class)) -- luajit allows omitting trailing ;
     end
 
     return setmetatable(class, STRUCT)
