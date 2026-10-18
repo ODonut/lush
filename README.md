@@ -1,224 +1,270 @@
 # lush
 
-A small, fast object-oriented programming library for Lua / LuaJIT with **multiple inheritance**, **C3 linearization**, cached method resolution, a `super` mechanism that works in diamond hierarchies, and **runtime-changeable inheritance**.
+A small object-oriented programming library for Lua with **multiple inheritance (C3 linearization)**, **cached method lookup**, **metamethod inheritance**, **runtime re-parenting**, and optional **LuaJIT FFI struct classes**.
 
-**Version:** 1.0
+Version 1.0
 
 ## Features
 
-- Single and multiple inheritance, resolved with the C3 method resolution order (MRO), the same algorithm used by Python.
-- Cooperative `super` that follows the MRO instead of naively calling "the parent".
-- Fast lookups: resolved keys are memoized per class and automatically invalidated when a class changes.
-- Classes can be modified at runtime. Adding, replacing, or removing a member updates every affected subclass.
-- Inheritance can be rewired at runtime with automatic rollback if the new hierarchy is invalid.
-- Metamethod support (`__tostring`, `__eq`, `__add`, ...).
-- Subclass tracking uses weak references, so unused subclasses can be garbage collected.
-- Safe on LuaJIT (guards against `cdata` triggering `__eq` when compared to `nil`).
-- Zero dependencies, one file.
-
-## Installation
-
-Copy the file into your project and require it:
-
-```lua
-local lush = require("lush")
-```
+- Single and multiple inheritance, resolved with C3 linearization (the same MRO algorithm Python uses)
+- `super()` that follows the MRO, so cooperative multiple inheritance works in diamonds
+- Per-class lookup cache: inherited members are resolved once, and the cache is invalidated automatically when you redefine members at runtime
+- Metamethods (`__add`, `__tostring`, `__call`, ...) are inherited and overridable like any other member
+- `orphan()` to change a class's parents after creation, with rollback if the new hierarchy is invalid
+- `struct()` (LuaJIT only) to define classes backed by FFI `cdata`, with inheritance of fields and methods
+- Clear errors for cyclic, redundant, or unresolvable inheritance
 
 ## Quick start
 
 ```lua
-local lush = require("lush")
+local lush   = require("lush")
+local class  = lush.class
+local Object = lush.Object
 
-local Animal = lush.class(lush.Object)
+local Animal = class(Object)
 
-function Animal.init(self, name)
+function Animal:init(name)
     self.name = name
 end
 
-function Animal.speak(self)
+function Animal:speak()
     return self.name .. " makes a sound"
 end
 
-local Dog = lush.class(Animal)
+local Dog = class(Animal)
 
-function Dog.init(self, name, breed)
-    lush.super(Dog, self).init(self, name)
-    self.breed = breed
+function Dog:speak()
+    return self.name .. " barks"
 end
 
-function Dog.speak(self)
-    return lush.super(Dog, self).speak(self) .. ": woof!"
+local d = Dog:new("Rex")
+print(d:speak())  --> Rex barks
+```
+
+`class(...)` takes any number of superclasses. Methods and fields are declared by assigning to the class (`function Dog:speak()` is just `Dog.speak = function ...`). Instances are created with `Class:new(...)`, which calls `init`.
+
+> **Note:** `class()` does not inherit from `Object` automatically. Pass `Object` (or a class that inherits it) if you want `new` and `init`.
+
+## Classes
+
+### Creating a class
+
+```lua
+local Base    = class(Object)       -- inherits Object
+local Derived = class(Base)         -- single inheritance
+local Mixed   = class(Base, Other)  -- multiple inheritance
+local Bare    = class()             -- no parents, no Object (no `new`)
+```
+
+### Instances
+
+`Object.new(class, ...)` creates an empty table whose metatable is the class's internal cache, then calls `init(instance, ...)`. If you override `new`, `init` is not called for you.
+
+```lua
+function Point:init(x, y)
+    self.x, self.y = x, y
 end
 
-local rex = Dog:new("Rex", "Husky")
-print(rex:speak())   --> Rex makes a sound: woof!
+local p = Point:new(1, 2)
 ```
 
-## API
+### Overriding and redefining at runtime
 
-The module returns a table with three members:
-
-| Member | Description |
-| --- | --- |
-| `lush.class(...)` | Creates a new class that inherits from the given superclasses. |
-| `lush.super(currentclass, instance)` | Returns the next declarations after `currentclass` in the MRO. |
-| `lush.Object` | An optional root class providing `init` and `new`. |
-
-### `lush.class(...)`
-
-Creates and returns a class. Pass zero or more classes as superclasses, in priority order from left to right.
+Assigning to a class declares the key on that class. Assigning `nil` removes the declaration, so lookups fall back to the parents. Caches of the class and all its descendants are updated automatically, so redefining a method on a parent takes effect everywhere immediately.
 
 ```lua
-local A = lush.class()                -- no superclass, no Object
-local B = lush.class(lush.Object)     -- single inheritance
-local C = lush.class(B, SomeMixin)    -- multiple inheritance
+function Animal:speak() return "..." end   -- existing Dogs see the new version
 ```
 
-Define members by assigning to the class. Reads fall through the MRO automatically.
+## Inheritance
+
+### Multiple inheritance and the MRO
+
+Superclasses are searched in C3 order. For `class(B, C)` where `B` and `C` both inherit `A`, the order is `D, B, C, A, Object`.
+
+### `super(currentclass, instance_or_class)`
+
+Returns the next entry in the MRO after `currentclass`, for the class of the given instance (or the class itself). Index it to get the next implementation, and pass `self` explicitly.
 
 ```lua
-function B.greet(self) return "hi" end
-B.max_hp = 100                        -- non-function values are inherited too
+local super = lush.super
+
+local A = class(Object)
+function A:hello() print("A") end
+
+local B = class(A)
+function B:hello() print("B"); super(B, self).hello(self) end
+
+local C = class(A)
+function C:hello() print("C"); super(C, self).hello(self) end
+
+local D = class(B, C)
+function D:hello() print("D"); super(D, self).hello(self) end
+
+D:new():hello()  --> D, B, C, A
 ```
 
-Errors raised while creating a class:
-
-| Error | Cause |
-| --- | --- |
-| `invalid superclass at argument N` | Argument N is not a lush class. |
-| `redundant inheritance` | A listed superclass is already an ancestor of another listed superclass. |
-| `cannot find a resolution for multiple inheritance` | The hierarchy has no consistent C3 order. |
-| `cyclic inheritance` | The class would end up as its own ancestor. |
-
-### `lush.Object`
-
-A root class you can opt into. It is not required, but gives you the standard construction flow:
-
-```lua
-function Object.init(instance) end
-
-function Object.new(class, ...)
-    -- creates an instance, then calls init(instance, ...)
-end
-```
-
-Create instances with `Class:new(...)`. Override `init` to set up your fields. If you create classes without `lush.Object`, you must provide your own `new`/`init` (or similar) construction logic. An instance's metatable is the class's resolved cache, so `instance.__class` gives you its class.
-
-### `lush.super(currentclass, instance)`
-
-Returns a table that resolves keys using only the classes **after** `currentclass` in the instance's MRO.
-
-```lua
-lush.super(Dog, self).speak(self)
-```
-
-Pass the class where the calling method is **defined**, not `self.__class`, otherwise subclasses would recurse infinitely.
-
-You can pass either an instance or a class as the second argument.
-
-Return values:
+Return values of `super`:
 
 | Value | Meaning |
-| --- | --- |
-| a table | The rest of the MRO. Index it to find the next implementation. |
-| `false` | `currentclass` is the last class in the MRO, so there is nothing above it. |
-| `nil` | `currentclass` is not in the MRO of `instance` at all. |
+|-------|---------|
+| table | Lookup target for the rest of the MRO. Index it to find the next definition. |
+| `false` | `currentclass` is the last class in the MRO. |
+| `nil` | `currentclass` is not in the MRO of that class. |
 
-Because of the `nil` case, `super` doubles as an `instanceof` check:
+Always pass the class in which the method is *defined* as `currentclass`, not `self.__class`.
 
-```lua
-local function instanceof(obj, class)
-    return lush.super(class, obj) ~= nil
-end
+### Inheritance errors
 
-print(instanceof(rex, Animal))   --> true
-```
+`class()` raises an error if the hierarchy is invalid:
 
-## Multiple inheritance
+| Message | Cause |
+|---------|-------|
+| `cyclic inheritance` | A class would end up as its own ancestor |
+| `redundant inheritance` | A superclass is listed alongside one of its own descendants, e.g. `class(Child, Parent)` |
+| `cannot find a resolution for multiple inheritance` | No consistent C3 order exists |
 
-Linearization follows C3, so diamond hierarchies behave predictably and each base class is initialized once when everyone cooperates through `super`.
+### Changing inheritance: `orphan(class, ...)`
 
-```lua
-local Base = lush.class(lush.Object)
-function Base.init(self)
-    self.log = {"Base"}
-end
-
-local Left = lush.class(Base)
-function Left.init(self)
-    lush.super(Left, self).init(self)
-    table.insert(self.log, "Left")
-end
-
-local Right = lush.class(Base)
-function Right.init(self)
-    lush.super(Right, self).init(self)
-    table.insert(self.log, "Right")
-end
-
-local Bottom = lush.class(Left, Right)
-function Bottom.init(self)
-    lush.super(Bottom, self).init(self)
-    table.insert(self.log, "Bottom")
-end
-
-local obj = Bottom:new()
-print(table.concat(obj.log, ", "))   --> Base, Right, Left, Bottom
--- MRO: Bottom -> Left -> Right -> Base -> Object
-```
-
-## Changing inheritance at runtime
-
-Every class has a `__superclasses` object. Call it with a new list of superclasses to rewire the class:
+Drops all current superclasses of `class` and optionally attaches new ones. The class and all of its descendants are rebuilt. If the new hierarchy is invalid, everything is rolled back and the error is rethrown.
 
 ```lua
-Dog.__superclasses(Animal, Swimmer)
+local orphan = lush.orphan
+
+orphan(Dog)            -- Dog now has no parents
+orphan(Dog, Pet, Dog2) -- Dog now inherits Pet and Dog2
 ```
 
-All affected subclasses have their MRO and caches rebuilt. If the new hierarchy is invalid (cycle, redundancy, or no C3 order), the call raises an error and **everything is rolled back** to its previous state.
-
-```lua
-local ok, err = pcall(function()
-    Animal.__superclasses(Dog)   -- would create a cycle
-end)
-print(ok, err)   --> false   cyclic inheritance
-```
-
-## Modifying classes at runtime
-
-Assigning to a class key updates the class and invalidates all dependent caches, so methods can be patched or removed at any time:
-
-```lua
-function Animal.speak(self) return "..." end   -- subclasses without their own speak see this
-Animal.speak = nil                             -- removes it again
-```
+Instance metatables stay valid across `orphan`, since the cache tables are reused.
 
 ## Metamethods
 
-Keys starting with `__` are treated as metamethods and kept physically in the class's cache so Lua can find them on instances. They are inherited through the MRO like any other key.
+Any key beginning with `__` is treated as a metamethod. These are copied into the class cache (which is the instances' metatable), inherited through the MRO, and overridable by subclasses.
 
 ```lua
-local Vec = lush.class(lush.Object)
+local Vec = class(Object)
 
-function Vec.init(self, x, y) self.x, self.y = x, y end
-function Vec.__add(a, b) return Vec:new(a.x + b.x, a.y + b.y) end
-function Vec.__tostring(v) return ("(%g, %g)"):format(v.x, v.y) end
+function Vec:init(x, y) self.x, self.y = x, y end
 
-print(Vec:new(1, 2) + Vec:new(3, 4))   --> (4, 6)
+function Vec.__add(a, b)
+    return Vec:new(a.x + b.x, a.y + b.y)
+end
+
+function Vec:__tostring()
+    return "(" .. self.x .. ", " .. self.y .. ")"
+end
+
+print(Vec:new(1, 2) + Vec:new(3, 4))  --> (4, 6)
 ```
 
-Metamethod support is intentionally included for completeness, but ordinary objects rarely need it.
+Be careful with `__index` and `__newindex`. If you declare `__index` as a function, instance lookups no longer go through the cache, so inherited methods won't be found unless your function handles them. Metamethod support is intentionally explicit, but use it sparingly: implicit behavior can be surprising.
 
-## Reserved names
+## Structs (LuaJIT only)
 
-Do not assign to these internal keys on a class (except `__superclasses` via a call as shown above):
+`struct(field_map, ...)` creates a class whose instances are FFI `cdata`. It requires LuaJIT's `ffi` module.
 
-`__class`, `__declared`, `__cache`, `__orders`, `__super_cache`, `__subclass_map`, `__superclasses`, `__i`
+```lua
+local struct = lush.struct
 
-## Notes and limitations
+local Point = struct({
+    x = "double",
+    y = "double",
+}, Object)
 
-- **`nil` lookups are not cached.** Lua cannot distinguish a cached `nil` from a missing entry, so looking up a key that does not exist walks the MRO each time. Avoid hot-path lookups of undefined members.
-- **`super` returns `false` at the top of the MRO.** Indexing `false` raises an error, so guard calls to `super` when you are not sure a parent implementation exists.
-- **Class lookups go through the MRO.** A key is first found in the class that declares it, so shadowing works exactly like normal inheritance. Instance fields set on the object itself always take priority.
-- **Subclass links are weak.** A class held only by its parent's subclass map can be garbage collected.
-- **Redundant base lists are rejected.** `lush.class(Dog, Animal)` errors because `Animal` is already an ancestor of `Dog`. List only the classes you need.
+function Point:init(x, y)
+    self.x, self.y = x, y
+end
+
+function Point:length()
+    return math.sqrt(self.x ^ 2 + self.y ^ 2)
+end
+
+local p = Point:new(3, 4)
+print(p:length())  --> 5
+```
+
+### Field types
+
+Each value in `field_map` can be:
+
+- a string in LuaJIT ctype syntax (`"int"`, `"double"`, `"int(*)[5]"`)
+- an existing ctype object (from `ffi.typeof`)
+- another lush struct class, embedded by value
+
+Fields from all struct ancestors are merged, with the nearest class winning on name conflicts. Fields are laid out sorted by alignment (descending), then size (descending), then name, so layout is deterministic and not in declaration order.
+
+### Special entries
+
+| Key | Meaning |
+|-----|---------|
+| `field_map[0] = true` | Declare the struct anonymously instead of as a named, forward-declared struct. Only use this if the struct doesn't need self or mutual references. |
+| `field_map[1] = "..."` | An attribute string appended after the struct body, e.g. `"__attribute__((packed))"`. |
+
+### Pointers and recursive structs
+
+Calling a named struct class returns its C type name, with any arguments appended. This lets you write pointers to structs that are still being defined:
+
+```lua
+local A = struct({}, Object)
+local B = struct({ a_ptr = A("*") }, Object)
+
+A.__field_map.b_ptr = B("*")   -- legal because neither is in use yet
+
+local a = A:new()
+a.b_ptr = B:new()
+a.b_ptr.a_ptr = a
+```
+
+Anonymous structs return `nil` when called.
+
+### Structs without `Object`
+
+If a struct does not inherit `Object`, it has no `new`. Use the metatype directly:
+
+```lua
+local S = struct({ n = "int" })
+local ctor = S.__metatype
+local s = ctor()
+```
+
+`init` is not called in this case.
+
+### Lazy evaluation and "in use"
+
+The underlying C struct and metatype are created lazily, the first time `__metatype` is read or `new` is called. At that point the class is **in use** and frozen:
+
+- assigning a member raises `struct cannot be modified after in use`
+- `orphan` raises `struct cannot have inheritance changed after in use`
+- modifying an *ancestor* of an in-use struct raises `ancestor classes cannot be modified if a descendant is a struct class`
+
+LuaJIT forbids changing a metatype's metatable after it's bound, which is why everything is copied into the cache up front. Define all methods and metamethods **before** the first `new`.
+
+Note that a struct's `field_map` is internal data. Mutating it after the struct (or any struct that embeds it) has been evaluated is not supported.
+
+## LuaJIT and `nil` comparison
+
+In LuaJIT, `cdata` can trigger `__eq` when compared with any value, including `nil`. The library's internals avoid this, but in your own code, use `rawequal(v, nil)` when `v` might be an instance of a struct class.
+
+## API reference
+
+| Function | Description |
+|----------|-------------|
+| `lush.class(...)` | Create a class with the given superclasses |
+| `lush.super(currentclass, instance_or_class)` | Next entry in the MRO after `currentclass` |
+| `lush.orphan(class, ...)` | Drop parents and optionally attach new ones, rebuilding descendants |
+| `lush.Object` | Base class providing `new` and an empty `init` |
+| `lush.struct(field_map, ...)` | Create an FFI struct class (LuaJIT only) |
+| `Object.new(class, ...)` | Create an instance and call `init` |
+| `Object.init(instance, ...)` | Constructor hook, empty by default |
+
+## Behavior notes and limitations
+
+- **`nil` is never cached.** A missing key is looked up through the whole MRO every time. Make sure instance fields are initialized in `init` if you test for them often.
+- **Reserved names.** Keys such as `__class`, `__declared`, `__cache`, `__orders`, `__super_cache`, `__subclass_map`, `__superclasses`, `__field_map`, and `__metatype` are used internally. Don't assign to them.
+- **Internals are not a public API.** In particular, the cache is derived data; writing to it with `rawset` is unsupported, and it is rebuilt (not restored) when `orphan` rolls back.
+- **Subclass tracking is weak.** Classes are held weakly by their parents, so unreferenced subclasses can be garbage collected.
+- **Don't recurse through `Object.new` with a different class** in a struct: struct `new` is not polymorphic, and the class passed in is ignored.
+
+## License
+
+Add your license here.
