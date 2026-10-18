@@ -16,12 +16,7 @@ local function is_nil(v)
 end
 
 
-local IN_USE_STRUCT = {
-    __index = index_cache,
-    __newindex = function(class, k, v)
-        error("struct cannot be modified after in use", 2)
-    end
-}
+local IN_USE_STRUCT
 --------------------------------------------------------------------------------------------------------------------------------
 
 -- this is necessary for every single subclass, because they might call super() and get proxies at any stage in the MRO, and subsequent access on the proxy might cache something.
@@ -637,13 +632,13 @@ local V = struct({
 }, Object)
 
 -- this will not properly update U, because reading V's __metatype causes it to be evaluated
--- which in turn evaluates U prior to the assignment since it has U as one of its field, evaluated structs are considered in-use and not intended to be modified, but then you modified its internal __field_map, which is not supported
--- U.__field_map.x = ffi.typeof("$[5]", V.__metatype)
+-- which in turn evaluates U prior to the assignment since it has U as one of its field, evaluated structs are considered in-use and not intended to be modified, but then you modified its internal __schema, which is not supported
+-- U.__schema.x = ffi.typeof("$[5]", V.__metatype)
 
 local A = struct({}, Object)
 local B = struct({a_ptr = A("*")}, Object)
 
-A.__field_map.b_ptr = B("*") -- recursive pointers work fine, because non-anonymous structs are forward declared yet not evaluated
+A.__schema.b_ptr = B("*") -- recursive pointers work fine, because non-anonymous structs are forward declared yet not evaluated
 
 local a = A:new()
 a.b_ptr = B:new()
@@ -658,15 +653,15 @@ local function resolve_struct(class)
 
     local cache = class.__cache
 
-    local accumulated_field_map = {}
+    local accumulated_schema = {}
     local orders = class.__orders
 
     for i = #orders, 1, -1 do
         local superclass = orders[i]
-        local inner_field_map = rawget(superclass, "__field_map") -- not guaranteed to exist, avoid trigger index_cache
-        if inner_field_map then
-            for k, v in pairs(inner_field_map) do
-                accumulated_field_map[k] = v
+        local inner_schema = rawget(superclass, "__schema") -- not guaranteed to exist, avoid trigger index_cache
+        if inner_schema then
+            for k, v in pairs(inner_schema) do
+                accumulated_schema[k] = v
             end
         end
 
@@ -678,12 +673,12 @@ local function resolve_struct(class)
     end
 
     
-    local anonymous = accumulated_field_map[0]
-    local attribute = accumulated_field_map[1]
+    local anonymous = accumulated_schema[0]
+    local attribute = accumulated_schema[1]
 
     -- avoid interfering with pairs()
-    accumulated_field_map[0] = nil
-    accumulated_field_map[1] = nil
+    accumulated_schema[0] = nil
+    accumulated_schema[1] = nil
     
 
     local keys = {}
@@ -705,7 +700,7 @@ local function resolve_struct(class)
     local array = {struct_name, "{"}
     local n = 2
 
-    for k, ctype in pairs(accumulated_field_map) do
+    for k, ctype in pairs(accumulated_schema) do
 
         local inner_ctype = ctype
         local ctype_t = type(ctype)
@@ -804,12 +799,21 @@ local function resolve_struct_new(class)
     return new, metatype
 end
 
-local function concat(a, b, ...)
-    if is_nil(b) then
-        return a
+local function concat_struct_name(class, ...)
+    if class.__schema[0] then -- anonymous
+        return nil
     end
-    return concat(a .. b, ...)
+    return table.concat({to_struct_name(class), ...})
 end
+
+-- local declared at top
+IN_USE_STRUCT = {
+    __index = index_cache,
+    __newindex = function(class, k, v)
+        error("struct cannot be modified after in use", 2)
+    end,
+    __call = concat_struct_name
+}
 
 local STRUCT = {
     __index = function(class, k)
@@ -831,19 +835,14 @@ local STRUCT = {
 
     __newindex = declare_key,
 
-    __call = function(class, ...)
-        if class.__field_map[0] then -- anonymous
-            return nil
-        end
-        return concat(to_struct_name(class), ...)
-    end,
+    __call = concat_struct_name,
 }
 
-local function create_struct(field_map, ...)
+local function create_struct(schema, ...)
     local class = create_class(...)
     setmetatable(class, nil) -- remove CLASS mt
 
-    class.__field_map = field_map
+    class.__schema = schema
 
     if class.__super_cache[Object] ~= nil then -- inherits Object
 
@@ -853,7 +852,7 @@ local function create_struct(field_map, ...)
         end
     end
 
-    local anonymous = field_map[0]
+    local anonymous = schema[0]
 
     if not anonymous then
         local struct_name = to_struct_name(class)
