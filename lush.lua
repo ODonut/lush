@@ -37,8 +37,8 @@ local function invalidate_super_cache_once(class, k, root)
 end
 
 local function invalidate_super_cache(class, k, root, visited)
-
-    visited[class] = true
+    
+    visited[class] = 2
     invalidate_super_cache_once(class, k, root)
     
 
@@ -52,13 +52,13 @@ end
 local function recurse_modify_cache(invalidate_cache, class, k, root, visited)
 
     -- track visited in case a child class inherits from 2 parent classes that both inherit from the same grandparent class, where with DFS, the child may be visited twice 
-    visited[class] = true
+    visited[class] = 1
 
     for subclass, v in pairs(class.__subclass_map) do
 
         -- guard for struct class
         if getmetatable(subclass) == IN_USE_STRUCT then
-            error("ancestor classes cannot be modified if a descendant is a struct class")
+            error("ancestor classes cannot be modified(unless has no effect) if a descendant is a struct class")
         end
 
         if not visited[subclass] then
@@ -68,6 +68,7 @@ local function recurse_modify_cache(invalidate_cache, class, k, root, visited)
                 invalidate_super_cache_once(subclass, k, root)
                 invalidate_cache(subclass, k, root, visited)
             else
+                -- because something is declared by this subclass, so the root's change does not affect subsequent structs in this branch, so no need to check IN_USE_STRUCT
                 -- otherwise only invalidate super_cache is necessary
                 -- use a different recursion because invalidate_cache stops recursing
                 invalidate_super_cache(subclass, k, root, visited) -- refresh_cache shares this branching because C3 guarantees that the subclass's cache has either this class's entry(because it declared it) or a sibling class's entry, so the root class's entry being changed is never relevant, thus can also just invalidate_super_cache()
@@ -127,7 +128,11 @@ local function safe_visit_modify_cache(modify_cache_once, modify_cache, visited,
         declared[k] = original
 
         for subclass, v in pairs(visited) do
-            modify_cache_once(subclass, k)
+            -- only if it's a normal/type 1 change, it needs to be fixed.
+            if visited[subclass] == 1 then
+                modify_cache_once(subclass, k)
+            end
+            
         end
 
         error(message, 3)
@@ -554,8 +559,24 @@ end
 -- drop superclasses of the class and rebuild(including descendants of the class), optionally provide new superclasses
 local function orphan_class(class, ...)
     local superclasses = class.__superclasses
+    local superclasses_n = #superclasses
 
     local new_superclasses = {...}
+    
+    -- if they are identical, no change is necessary
+    if #new_superclasses == superclasses_n then
+        local identical = true
+        for i = 1, superclasses_n do
+            if new_superclasses[i] ~= superclasses[i] then
+                identical = false
+                break
+            end
+        end
+        if identical then
+            return
+        end
+    end
+
     class.__superclasses = new_superclasses
 
     -- remove all old relationship
