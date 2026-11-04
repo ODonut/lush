@@ -3,10 +3,6 @@
 
 
 
-local function index_cache(class, k)
-    return class.__cache[k]
-end
-
 --------------------------------------------------------------------------------------------------------------------------------
 -- luajit stuff
 --------------------------------------------------------------------------------------------------------------------------------
@@ -422,7 +418,9 @@ local MRO_CACHE = {
 
 
 local CLASS = {
-    __index = index_cache,
+    __index = function(class, k)
+        return class.__cache[k]
+    end,
     __newindex = declare_key,
 }
 
@@ -639,115 +637,56 @@ end
 -- extension for luajit's cdata
 local success, ffi = pcall(require, "ffi")
 
-local STRUCT_NAME_PREFIX = "struct LUSH_"
+local STRUCT_NAME_PREFIX = "struct __LUSH__"
 local STRUCT_NAME_COUNT = 0
 
-local function resolve_struct_name(class)
-    STRUCT_NAME_COUNT = STRUCT_NAME_COUNT + 1
-
-    local struct_name = STRUCT_NAME_PREFIX .. STRUCT_NAME_COUNT
-    class.__struct_name = struct_name
-
-    return struct_name
+local function to_struct_name(count)
+    return STRUCT_NAME_PREFIX .. count
 end
 
---[[
--- struct types are lazily evaluated, but safety is not guaranteed
+local function next_struct_name(class)
+    local struct_name_count = STRUCT_NAME_COUNT
+    local struct_name = to_struct_name(struct_name_count)
+    STRUCT_NAME_COUNT = STRUCT_NAME_COUNT + 1
 
-local U = struct({
-    x = "int(*)[5]" -- use luajit's ffi syntax for ctypes, this is a pointer to an array of 5 ints
-}, Object)
+    return struct_name, struct_name_count -- start at 0
+end
 
-local V = struct({
-    y = U -- when the table is directly provided, 
-}, Object)
 
--- this will not properly update U, because reading V's __metatype causes it to be evaluated
--- which in turn evaluates U prior to the assignment since it has U as one of its field, evaluated structs are considered in-use and not intended to be modified, but then you modified its internal __schema, which is not supported
--- U.__schema.x = ffi.typeof("$[5]", V.__metatype)
+local function parse_ctype(ctype)
+    local ctype_t = type(ctype)
 
-local A = struct({}, Object)
-local B = struct({a_ptr = A("*")}, Object)
-
-A.__schema.b_ptr = B("*") -- recursive pointers work fine, because non-anonymous structs are forward declared yet not evaluated
-
-local a = A:new()
-a.b_ptr = B:new()
-a.b_ptr.a_ptr = a
-]]
-
--- not recommended to pcall, but it will work because redundant cdef of incomplete struct declaration is harmless in C
--- if you need additional functionality, you can override new() with custom logic directly.
-local function resolve_struct_metatype(class)
-    local cache = class.__cache
-
-    local accumulated_schema = {}
-    local orders = class.__orders
-
-    for i = #orders, 1, -1 do
-        local superclass = orders[i]
-        local inner_schema = rawget(superclass, "__schema") -- not guaranteed to exist, avoid trigger index_cache
-        if inner_schema then
-            for k, v in pairs(inner_schema) do
-                accumulated_schema[k] = v
-            end
-        end
-
-        -- luajit states modification to metatable used for metatype is prohibited, so copy everything to cache ahead of time.
-        -- see https://github.com/LuaJIT/LuaJIT/issues/41 for details
-        for k, v in pairs(superclass.__declared) do
-            cache[k] = v
-        end
-    end
-
-    local schema = class.__schema
-    local anonymous = schema[0] -- metadata are not inherited
-    local attribute = schema[1]
-
-    -- avoid interfering with pairs()
-    accumulated_schema[0] = nil
-    accumulated_schema[1] = nil
-    
-
-    local keys = {}
-    local keys_n = 0
-
-    local ctype_map = {}
-
-    local struct_name = "struct "
-
-    -- by default class uses address as name to handle self pointer or mutually recursive pointer, which is permanent in ffi's cdef space
-    -- if you guarantees it can be expressed anonymously, toggle it in [0]
-
-    if not anonymous then -- [0] may store a boolean to toggle anonymous behavior
-        struct_name = class.__struct_name
-        -- cdef is already done in create_struct
-    end
-
-    local array = {struct_name, "{"}
-    local n = 2
-
-    for k, ctype in pairs(accumulated_schema) do
-
-        local inner_ctype = ctype
-        local ctype_t = type(ctype)
-
-        if ctype_t == "string" then
-            
-            inner_ctype = ffi.typeof(ctype)
-
-        elseif ctype_t == "table" then -- assumption: a lush class is given
+    if ctype_t == "string" then
         
-            inner_ctype = ctype.__metatype
-        end
+        return ffi.typeof(ctype)
 
-        keys_n = keys_n + 1
-        keys[keys_n] = k
-
-        ctype_map[k] = inner_ctype
+    elseif ctype_t == "table" then -- assumption: a lush class is given
+    
+        return ctype.__metatype
     end
 
-    table.sort(keys, function(a, b)
+    return ctype -- assume it's cdata
+end
+
+local function to_schema_keys(schema, ctype_map)
+    local schema_keys = {}
+    local schema_keys_n = 0
+
+    local anonymous = schema[0]
+    local attribute = schema[1]
+    schema[0] = nil
+    schema[1] = nil
+
+    for k, ctype in pairs(schema) do
+        schema_keys_n = schema_keys_n + 1
+        schema_keys[schema_keys_n] = k
+        ctype_map[k] = parse_ctype(ctype)
+    end
+
+    schema[0] = anonymous
+    schema[1] = attribute
+
+    table.sort(schema_keys, function(a, b)
 		local actype = ctype_map[a]
 		local bctype = ctype_map[b]
 
@@ -768,12 +707,18 @@ local function resolve_struct_metatype(class)
 		return a < b
     end)
 
+    return schema_keys, schema_keys_n, attribute
+end
+
+local function to_struct_definition(accumulated_schema_keys, accumulated_schema_keys_n, ctype_map, struct_name, attribute)
+    local array = {struct_name, "{"}
+    local n = 2
 
     local ctypes = {}
     local ctypes_n = 0
 
-    for i = 1, keys_n do
-        local k = keys[i]
+    for i = 1, accumulated_schema_keys_n do
+        local k = accumulated_schema_keys[i]
 
         ctypes_n = ctypes_n + 1
         ctypes[ctypes_n] = ctype_map[k]
@@ -790,29 +735,114 @@ local function resolve_struct_metatype(class)
         n = n + 1
         array[n] = ";"
     end
-
+    
     n = n + 1
     array[n] = "}"
 
 
-    n = n + 1
-    array[n] = attribute
+    if attribute then
+        n = n + 1
+        array[n] = attribute
+    end
 
-    -- unpack is a global in luajit
-    local metatype = ffi.metatype(ffi.typeof(table.concat(array), unpack(ctypes, 1, ctypes_n)), cache)
-    class.__metatype = metatype
-
-    return metatype
+    return array, n, ctypes, ctypes_n
 end
 
 
 local STRUCT
 
+-- not recommended to pcall, but it will work because redundant cdef of incomplete struct declaration is harmless in C
+-- if you need additional functionality, you can override new() with custom logic directly.
+local function resolve_struct_metatype(class)
+
+    local schema = class.__schema
+
+    local ctype_map = {}
+    local schema_keys, schema_keys_n, attribute = to_schema_keys(schema, ctype_map)
+
+    local struct_name = class.__struct_name_count -- changing metadata like anonymous is not supported
+    struct_name = struct_name and to_struct_name(struct_name) or "struct"
+
+    -- by default class has a name to handle self ptr or mutually recursive ptr, which is permanent in ffi's cdef space
+    -- if you guarantees it can be expressed anonymously, toggle it in [0]
+    -- cdef is already done in create_struct
+    local cache = class.__cache
+
+    local accumulated_schema_keys = {}
+    local accumulated_schema_keys_n = 0
+
+    local orders = class.__orders
+    local orders_n = #orders
+
+    for i = orders_n, 1, -1 do
+        local superclass = orders[i]
+        
+        -- luajit states modification to metatable used for metatype is prohibited, so copy everything to cache ahead of time.
+        -- see https://github.com/LuaJIT/LuaJIT/issues/41 for details
+        for k, v in pairs(superclass.__declared) do
+            cache[k] = v
+        end
+    end
+
+    for i = 2, orders_n do
+        local superclass = orders[i]
+        local metatable = getmetatable(superclass)
+
+        if metatable == STRUCT or metatable == IN_USE_STRUCT then
+
+            local inner_schema = superclass.__schema
+            local inner_schema_keys = superclass.__schema_keys -- may be computed
+
+            if inner_schema[1] ~= attribute then
+                error("subclass struct must have the same attribute")
+            end
+
+            for j = 1, #inner_schema_keys do
+                local k = inner_schema_keys[j]
+
+                if not is_nil(ctype_map[k]) then
+                    error("subclass struct cannot override a field")
+                end
+
+                accumulated_schema_keys_n = accumulated_schema_keys_n + 1
+                accumulated_schema_keys[accumulated_schema_keys_n] = k
+
+                ctype_map[k] = parse_ctype(inner_schema[k])
+            end
+
+        end
+    end
+    
+    -- struct's own fields are added last
+    for i = 1, schema_keys_n do
+        accumulated_schema_keys_n = accumulated_schema_keys_n + 1
+        accumulated_schema_keys[accumulated_schema_keys_n] = schema_keys[i]
+    end
+
+
+
+    -- unpack is a global in luajit
+    -- ffi.typeof does not accept trailing ;
+    local array, n, ctypes, ctypes_n = to_struct_definition(accumulated_schema_keys, accumulated_schema_keys_n, ctype_map, struct_name, attribute)
+    local metatype = ffi.metatype(ffi.typeof(table.concat(array, nil, 1, n), unpack(ctypes, 1, ctypes_n)), cache)
+    class.__metatype = metatype
+
+    -- derived-specific size for casting purposes
+    local derived_array, derived_array_n, derived_ctypes, derived_ctypes_n = to_struct_definition(schema_keys, schema_keys_n, ctype_map, "struct", attribute)
+    class.__derived_size = ffi.sizeof(ffi.typeof(table.concat(derived_array, nil, 1, derived_array_n), unpack(derived_ctypes, 1, derived_ctypes_n)))
+
+
+    -- schema_keys is not stored
+    return metatype, schema_keys
+end
+
+
+
 local function resolve_struct(class)
     -- remove the STRUCT mt
     setmetatable(class, nil)
 
-    local success, metatype = pcall(resolve_struct_metatype, class)
+    local success, metatype, schema_keys = pcall(resolve_struct_metatype, class)
     if not success then
         reset_cache(class) -- not warming is fine in this case, because resovle_struct_metatype will copy everything into cache if called again later
 
@@ -823,7 +853,7 @@ local function resolve_struct(class)
     -- freeze class, internals are still mutable since in lua it is difficult to enforce immutability, but it's not supported
     setmetatable(class, IN_USE_STRUCT)
 
-    return metatype
+    return metatype, schema_keys
 end
 
 -- class's metatable should currently be STRUCT
@@ -831,7 +861,8 @@ local function resolve_struct_new(class)
     local cache = class.__cache
     local init = cache.init -- struct is immutable after in-use, so this is fine
 
-    local metatype
+    local metatype, schema_keys
+
     local declared = class.__declared
     local original_new = declared.new
     local new = original_new
@@ -843,54 +874,71 @@ local function resolve_struct_new(class)
             return instance
         end
 
+
         declared.new = new
     end
 
     local success
-    success, metatype = pcall(resolve_struct, class)
+    success, metatype, schema_keys = pcall(resolve_struct, class)
 
     if not success then
         declared.new = original_new
         error(metatype, 0)
     end
 
-    return new, metatype
+    return new, metatype, schema_keys
 end
 
 local function concat_struct_name(class, ...)
-    local struct_name = rawget(class, "__struct_name")
-    if not struct_name then
+    local struct_name_count = class.__struct_name_count
+    if not struct_name_count then
         return nil
     end
-    return table.concat({struct_name, ...})
+    return table.concat({to_struct_name(struct_name_count), ...})
 end
 
 -- local declared at top
 IN_USE_STRUCT = {
-    __index = index_cache,
+    __index = function(class, k)
+        if rawequal(k, "__schema_keys") then -- this is a computed field
+            return to_schema_keys(class.__schema)
+        end
+        return class.__cache[k]
+    end,
     __newindex = function(class, k, v)
         error("struct cannot be modified after in use", 2)
     end,
     __call = concat_struct_name
 }
 
+
+local function smart_resolve_struct(class)
+    local super_cache = class.__super_cache
+    if super_cache[Object] == nil then
+        return resolve_struct(class)
+    else
+        local new, metatype, schema_keys
+        new, metatype, schema_keys = resolve_struct_new(class)
+        return metatype, schema_keys
+    end
+end
+
 STRUCT = {
     __index = function(class, k)
         local super_cache = class.__super_cache
-        if k == "__metatype" then
-            local metatype
 
-            if super_cache[Object] == nil then
-                metatype = resolve_struct(class)
-            else
-                local new
-                new, metatype = resolve_struct_new(class)
-            end
-
+        if rawequal(k, "__schema_keys") then
+            local metatype, schema_keys = smart_resolve_struct(class)
+            return schema_keys
+            
+        elseif rawequal(k, "__metatype") then
+            local metatype = smart_resolve_struct(class)
             return metatype
-        elseif k == "new" then
 
-            -- custom new cannot be inherited, otherwise if a struct inherits from another struct, it will use its superclass struct's new, which is strange
+        elseif rawequal(k, "new") then
+            
+
+            -- custom new cannot be inherited, otherwise if a struct inherits from another struct, it will use its superclass struct's new, which is likely the unexpected behavior
             local new = class.__declared.new
             if new then
                 return new
@@ -918,11 +966,60 @@ local function create_struct(schema, ...)
     class.__schema = schema
 
     local anonymous = schema[0]
-    if not anonymous then
-        ffi.cdef(resolve_struct_name(class)) -- luajit allows omitting trailing ;
+    if anonymous then
+        class.__struct_name_count = false
+    else
+        local struct_name, struct_name_count = next_struct_name(class)
+        class.__struct_name_count = struct_name_count
+        ffi.cdef(struct_name) -- the trailing ; can be omitted in ffi
     end
 
     return setmetatable(class, STRUCT)
+end
+
+local function calculate_offset(class, superclass)
+    local orders = class.__orders
+    local offset = 0
+
+    for i = 2, #orders do
+        local inner_superclass = orders[i]
+        if getmetatable(inner_superclass) == IN_USE_STRUCT then -- should all be IN_USE_STRUCT or CLASS, since resolve a descendant causes its ancestors to all be resolved
+            if inner_superclass == superclass then
+                return offset
+            end
+            offset = offset + inner_superclass.__derived_size
+        end
+    end
+
+    return nil
+end
+
+local function cast_struct(superclass, instance)
+    local class = instance.__class
+    if superclass == class then
+        return instance
+    end
+
+    local offset
+
+    if class.__super_cache[superclass] ~= nil then -- this is an upcast
+       offset = calculate_offset(class, superclass)
+    elseif superclass.__super_cache[class] ~= nil then -- this is a downcast
+        offset = -calculate_offset(superclass, class) -- negative offset to go before instance
+    else
+        error("attempted to cast instance to an unrelated class", 2)
+    end
+
+    -- assuming instance is a cdata struct(also passed by reference in luajit and behaves basically like a ptr), not an actual struct ptr
+    -- convert it to a char ptr
+    local instance_ptr = ffi.cast(ffi.typeof("char*"), instance)
+    instance_ptr = instance_ptr + offset -- offset is in bytes
+
+    local superclass_metatype = superclass.__metatype
+    instance_ptr = ffi.cast(ffi.typeof("$*", superclass_metatype), instance_ptr)
+
+    -- you need to keep the original instance alive, otherwise the cdata wrapper of this casted base instance could point to garbage collected memory
+    return instance_ptr[0] -- dereference the struct, the cdata wrapper on the lua side points to the same struct on the C side, dereferencing it makes it represent a literal struct value, but does not change the pass by reference behavior on the lua side
 end
 
 --------------------------------------------------------------------------------------------------------------------------------
@@ -936,4 +1033,5 @@ return {
     Object = Object,
 
     struct = create_struct,
+    cast = cast_struct,
 }
